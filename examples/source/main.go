@@ -4,19 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math"
 	"time"
 
 	metrigo "github.com/metricq/metrigo"
 )
 
 type ExampleSourceConfig struct {
-    Id string `json:"_id"`
-    Rev string `json:"_rev"`
+	Id  string `json:"_id"`
+	Rev string `json:"_rev"`
 }
 
-
 func main() {
-    agent := metrigo.New("source-go-example", "amqp://admin:admin@localhost")
+	agent := metrigo.NewAgent("source-go-example", "amqp://admin:admin@localhost")
 
 	defer agent.Close()
 
@@ -24,18 +24,31 @@ func main() {
 	agent.Connect()
 	log.Print("Done.")
 
-    var src metrigo.Source
+	var src metrigo.Source
 
-    ctx, cancel := context.WithTimeout(context.Background(), 60 * time.Second) 
-    resp := src.Register(ctx, agent)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 
-    config := new(ExampleSourceConfig)
-    err := json.Unmarshal(resp, config)
-    if err != nil {
-        log.Panicf("Failed to parse Source config: %s", err)
-    }
+	resp := src.Register(ctx, agent)
 
-    log.Printf("Received config: %s", config)
+	config := new(ExampleSourceConfig)
+	err := json.Unmarshal(resp, config)
+	if err != nil {
+		log.Panicf("Failed to parse Source config: %s", err)
+	}
 
-    cancel()
+	log.Printf("Received config: %s", config)
+
+	src.DeclareMetrics(ctx, []string{"go.dummy.source"})
+
+	metric := src.Metric("go.dummy.source")
+
+    log.Print("String to send data points")
+
+	for {
+		tp := time.Now().UnixNano()
+		metric.Send(context.Background(), tp, math.Sin(2*math.Pi*float64(tp)/1e10))
+
+		time.Sleep(100 * time.Millisecond)
+	}
 }

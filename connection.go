@@ -2,10 +2,9 @@ package metrigo
 
 import (
 	"context"
+	"log"
 
 	amqp "github.com/rabbitmq/amqp091-go"
-
-	"log"
 )
 
 type Connection struct {
@@ -42,7 +41,7 @@ func (con *Connection) Publish(ctx context.Context, routingKey string, payload [
 		ContentEncoding: "",
 		DeliveryMode:    amqp.Persistent,
 		Priority:        0,
-		AppId:           "sequential-producer",
+		AppId:           "",
 		Body:            payload,
 	}
 

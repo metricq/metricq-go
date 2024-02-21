@@ -4,16 +4,24 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+    "fmt"
 	"log"
+	"os"
 	"time"
 
 	uuid "github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+type RpcResponse struct {
+	Sender string
+	Body   []byte
+}
+
 type rpcRequest struct {
 	CorrelationId string
-	Response      chan<- []byte
+	Response      chan<- amqp.Delivery
+	CleanUp       bool
 }
 
 type Agent struct {
@@ -28,6 +36,10 @@ func NewAgent(token, server string) *Agent {
 	return &Agent{
 		token: token, Server: server,
 	}
+}
+
+type rpcFunctionRequest struct {
+	Function string `json:"function"`
 }
 
 func (con *Agent) Connect() {
@@ -51,8 +63,8 @@ func (con *Agent) Connect() {
 
 	con.rpc_queue = &queue
 
-    rpc_chan := make(chan rpcRequest)
-    con.rpc_chan = rpc_chan
+	rpc_chan := make(chan rpcRequest)
+	con.rpc_chan = rpc_chan
 
 	rpc_channel, err := con.connection.connection.Channel()
 	if err != nil {
@@ -67,35 +79,112 @@ func (con *Agent) Connect() {
 
 		log.Printf("Starting RPC consume on queue %s", queue.Name)
 
-		handlers := make(map[string](chan<- []byte))
+		handlers := make(map[string](rpcRequest))
 
 	ConsumeLoop:
 		for {
 			select {
 			case packet := <-consumer:
+				// TODO technically speaking, if shit went wrong, we are supposed
+				// to requeue these messages, but well ¯\_(ツ)_/¯
+
 				if channel.IsClosed() {
 					log.Print("RPC Channel closed. Stopped RPC consume.")
 					break ConsumeLoop
 				}
 
-				response_channel, ok := handlers[packet.CorrelationId]
+				handler, ok := handlers[packet.CorrelationId]
 
 				if ok {
 					log.Printf("Received RPC response for %s from: %s", packet.CorrelationId, packet.AppId)
 
-					response_channel <- packet.Body
-					close(response_channel)
-					delete(handlers, packet.CorrelationId)
+					handler.Response <- packet
+
+					if handler.CleanUp {
+						close(handler.Response)
+						delete(handlers, packet.CorrelationId)
+					}
 				} else {
+					request := rpcFunctionRequest{}
+					err := json.Unmarshal(packet.Body, &request)
+					if err == nil {
+						handler, ok := handlers[request.Function]
+						if ok {
+							handler.Response <- packet
+							break
+						}
+					}
+
 					log.Printf("Received unexpected RPC message (%s) from %s: %s", packet.CorrelationId, packet.AppId, packet.Body)
 				}
 			case request := <-requests:
-				// we got a new request, just store the response channel
 				// TODO clean up handlers after a timeout
-				handlers[request.CorrelationId] = request.Response
+				// TODO don't overwrite old handlers?
+				handlers[request.CorrelationId] = request
 			}
 		}
 	}(rpc_channel, &queue, rpc_chan)
+}
+
+type discoverResponse struct {
+	Alive          bool      `json:"alive"`
+	CurrentTime    time.Time `json:"currentTime"`
+	StartingTime   time.Time `json:"startingTime"`
+	MetricqVersion string    `json:"metricqVersion"`
+	Version        string    `json:"version"`
+	Hostname       string    `json:"hostname"`
+}
+
+func (con *Agent) SendRpcResponse(ctx context.Context, packet amqp.Delivery, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("Failed to marshal JSON payload: %w", err)
+	}
+
+	response := amqp.Publishing{
+		ContentType:   "text/plain",
+		CorrelationId: packet.CorrelationId,
+		Body:          data,
+		AppId:         con.token,
+	}
+
+	return con.connection.channel.PublishWithContext(ctx, "", packet.ReplyTo, true, false, response)
+}
+
+func (con *Agent) HandleDiscover(ctx context.Context, version string) {
+	start_time := time.Now()
+	response_channel := make(chan amqp.Delivery)
+
+	con.RegisterRpcHandler("discover", response_channel)
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Printf("Failed to get hostname: %s", err)
+		hostname = "[unknown]"
+	}
+
+HandlerLoop:
+	for {
+		select {
+		case packet := <-response_channel:
+            log.Printf("Respond to discover RPC from: %s", packet.AppId)
+
+			err := con.SendRpcResponse(ctx, packet, discoverResponse{
+				Alive:          true,
+				CurrentTime:    time.Now(),
+				StartingTime:   start_time,
+				MetricqVersion: "metricq-go/0.0.1",
+				Version:        version,
+				Hostname:       hostname,
+			})
+
+			if err != nil {
+				log.Panicf("Failed to publish rpc response: %s", err)
+			}
+		case <-ctx.Done():
+			break HandlerLoop
+		}
+	}
 }
 
 func makeCorrelationId() string {
@@ -111,12 +200,9 @@ func (con *Agent) Rpc(ctx context.Context, exchange, function string, payload an
 	}
 	log.Printf("Body Contents: %s", data)
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	correlationId := makeCorrelationId()
 
-	publishing := amqp.Publishing{
+	response := amqp.Publishing{
 		ContentType:   "text/plain",
 		CorrelationId: correlationId,
 		ReplyTo:       con.rpc_queue.Name,
@@ -124,28 +210,39 @@ func (con *Agent) Rpc(ctx context.Context, exchange, function string, payload an
 		AppId:         con.token,
 	}
 
-	rpc_request_chan := make(chan []byte)
+	rpc_request_chan := make(chan amqp.Delivery)
 
 	rpc_request := rpcRequest{
 		CorrelationId: correlationId,
 		Response:      rpc_request_chan,
+		CleanUp:       true,
 	}
 
 	con.rpc_chan <- rpc_request
 
-	err = con.connection.channel.PublishWithContext(ctx, exchange, function, true, false, publishing)
+	err = con.connection.channel.PublishWithContext(ctx, exchange, function, true, false, response)
 	if err != nil {
 		log.Panicf("Failed to publish rpc message: %s", err)
 	}
 
 	select {
 	case response := <-rpc_request_chan:
-		return response, nil
-	case <-time.After(5 * time.Second):
+		return response.Body, nil
+	case <-ctx.Done():
 		return nil, errors.New("Timeout in RPC call. Function: " + function)
 	}
 }
 
+func (con *Agent) RegisterRpcHandler(function string, rpc_response chan<- amqp.Delivery) {
+	con.rpc_chan <- rpcRequest{
+		CorrelationId: function,
+		Response:      rpc_response,
+		CleanUp:       false,
+	}
+}
+
 func (con *Agent) Close() {
-	con.connection.Close()
+	if con.connection != nil {
+		con.connection.Close()
+	}
 }

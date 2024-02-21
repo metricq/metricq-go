@@ -52,5 +52,7 @@ func (con *Connection) Publish(ctx context.Context, routingKey string, payload [
 }
 
 func (con *Connection) Close() {
-	con.connection.Close()
+	if con.connection != nil {
+		con.connection.Close()
+	}
 }

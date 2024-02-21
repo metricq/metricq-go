@@ -7,7 +7,8 @@ import (
 	"math"
 	"time"
 
-	metrigo "github.com/metricq/metrigo"
+	"github.com/alecthomas/kong"
+	metricq "github.com/metricq/metricq-go"
 )
 
 type ExampleSourceConfig struct {
@@ -15,8 +16,29 @@ type ExampleSourceConfig struct {
 	Rev string `json:"_rev"`
 }
 
+type ExampleSourceMetricMetadata struct {
+	metricq.MetricMetadata
+	Zebras string `json:"zebras"`
+}
+
+var CLI struct {
+	Server string `help:"MetricQ server URL." default:"amqp://admin:admin@localhost"`
+	Token  string `help:"A token to identify this client on the MetricQ network." default:"source-go-example"`
+}
+
 func main() {
-	agent := metrigo.NewAgent("source-go-example", "amqp://admin:admin@localhost")
+	cli := kong.Parse(&CLI)
+
+	switch cli.Command() {
+	case "":
+		run_source(CLI.Server, CLI.Token)
+	default:
+		panic(cli.Command())
+	}
+}
+
+func run_source(server, token string) {
+	agent := metricq.NewAgent(token, server)
 
 	defer agent.Close()
 
@@ -24,11 +46,12 @@ func main() {
 	agent.Connect()
 	log.Print("Done.")
 
-	var src metrigo.Source
+	go agent.HandleDiscover(context.Background(), "1.0.0")
+
+	var src metricq.Source
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-
 	resp := src.Register(ctx, agent)
 
 	config := new(ExampleSourceConfig)
@@ -39,11 +62,20 @@ func main() {
 
 	log.Printf("Received config: %s", config)
 
-	src.DeclareMetrics(ctx, []string{"go.dummy.source"})
+	src.DeclareMetrics(ctx, map[string]interface{}{
+		"go.dummy.source": ExampleSourceMetricMetadata{
+			MetricMetadata: metricq.MetricMetadata{
+				Description: "Dummy metric from the go example source",
+				Rate:        0.1,
+				Unit:        "puppies",
+			},
+			Zebras: "yes please!",
+		},
+	})
 
 	metric := src.Metric("go.dummy.source")
 
-    log.Print("String to send data points")
+	log.Print("String to send data points")
 
 	for {
 		tp := time.Now().UnixNano()
@@ -51,4 +83,5 @@ func main() {
 
 		time.Sleep(100 * time.Millisecond)
 	}
+
 }

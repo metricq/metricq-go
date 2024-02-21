@@ -50,17 +50,23 @@ func (src *Source) Register(ctx context.Context, agent *Agent) json.RawMessage {
 
 	src.connection = new(Connection)
 	src.connection.Connect(data.parseDataServer(agent.Server))
-    src.connection.exchange = data.DataExchange 
+	src.connection.exchange = data.DataExchange
 
 	return data.Config
 }
 
-type MetricDeclareMessage struct {
-	Function string   `json:"function"`
-	Metrics  []string `json:"metrics"`
+type MetricMetadata struct {
+	Description string  `json:"description"`
+	Unit        string  `json:"unit"`
+	Rate        float64 `json:"rate"`
 }
 
-func (src *Source) DeclareMetrics(ctx context.Context, metrics []string) {
+type MetricDeclareMessage struct {
+	Function string                 `json:"function"`
+	Metrics  map[string]interface{} `json:"metrics"`
+}
+
+func (src *Source) DeclareMetrics(ctx context.Context, metrics map[string]interface{}) {
 	response, err := src.agent.Rpc(ctx, "metricq.management", "source.declare_metrics", MetricDeclareMessage{Function: "source.declare_metrics", Metrics: metrics})
 	if err != nil {
 		log.Panicf("Failed to source.declare_metrics RPC: %s", err)

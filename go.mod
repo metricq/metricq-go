@@ -1,7 +1,10 @@
-module github.com/metricq/metrigo
+module github.com/metricq/metricq-go
 
 go 1.21.0
 
-require github.com/rabbitmq/amqp091-go v1.8.1
-require google.golang.org/protobuf v1.27.1
-require github.com/google/uuid v1.3.1
+require (
+	github.com/google/uuid v1.3.1
+	github.com/rabbitmq/amqp091-go v1.8.1
+	google.golang.org/protobuf v1.27.1
+	github.com/alecthomas/kong v0.8.1 // examples
+)

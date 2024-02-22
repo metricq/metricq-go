@@ -11,12 +11,8 @@ import (
 )
 
 type Source struct {
+	Agent
 	connection *Connection
-	agent      *Agent
-}
-
-type SourceRegisterMessage struct {
-	Function string `json:"function"`
 }
 
 type SourceRegisterResponse struct {
@@ -33,9 +29,8 @@ func (resp *SourceRegisterResponse) parseDataServer(server string) string {
 	}
 }
 
-func (src *Source) Register(ctx context.Context, agent *Agent) json.RawMessage {
-	src.agent = agent
-	response, err := agent.Rpc(ctx, "metricq.management", "source.register", SourceRegisterMessage{Function: "source.register"})
+func (src *Source) Register(ctx context.Context) json.RawMessage {
+	response, err := src.Rpc(ctx, "metricq.management", "source.register", RpcMessage{"source.register"})
 	if err != nil {
 		log.Panicf("Failed to source.register RPC: %s", err)
 	}
@@ -49,7 +44,7 @@ func (src *Source) Register(ctx context.Context, agent *Agent) json.RawMessage {
 	}
 
 	src.connection = new(Connection)
-	src.connection.Connect(data.parseDataServer(agent.Server))
+	src.connection.Connect(data.parseDataServer(src.Server))
 	src.connection.exchange = data.DataExchange
 
 	return data.Config
@@ -62,12 +57,12 @@ type MetricMetadata struct {
 }
 
 type MetricDeclareMessage struct {
-	Function string                 `json:"function"`
-	Metrics  map[string]interface{} `json:"metrics"`
+	RpcMessage
+	Metrics map[string]interface{} `json:"metrics"`
 }
 
 func (src *Source) DeclareMetrics(ctx context.Context, metrics map[string]interface{}) {
-	response, err := src.agent.Rpc(ctx, "metricq.management", "source.declare_metrics", MetricDeclareMessage{Function: "source.declare_metrics", Metrics: metrics})
+	response, err := src.Rpc(ctx, "metricq.management", "source.declare_metrics", MetricDeclareMessage{RpcMessage{"source.declare_metrics"}, metrics})
 	if err != nil {
 		log.Panicf("Failed to source.declare_metrics RPC: %s", err)
 	}

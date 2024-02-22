@@ -38,21 +38,21 @@ func main() {
 }
 
 func run_source(server, token string) {
-	agent := metricq.NewAgent(token, server)
+	src := metricq.Source{
+		Agent: metricq.NewAgent(token, server),
+	}
 
-	defer agent.Close()
+	defer src.Close()
 
 	log.Print("Establishing Connection to MetricQ...")
-	agent.Connect()
+	src.Connect()
 	log.Print("Done.")
 
-	go agent.HandleDiscover(context.Background(), "1.0.0")
-
-	var src metricq.Source
+	go src.HandleDiscover(context.Background(), "1.0.0")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	resp := src.Register(ctx, agent)
+	resp := src.Register(ctx)
 
 	config := new(ExampleSourceConfig)
 	err := json.Unmarshal(resp, config)

@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-    "fmt"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -32,13 +32,13 @@ type Agent struct {
 	rpc_chan   chan<- rpcRequest
 }
 
-func NewAgent(token, server string) *Agent {
-	return &Agent{
+func NewAgent(token, server string) Agent {
+	return Agent{
 		token: token, Server: server,
 	}
 }
 
-type rpcFunctionRequest struct {
+type RpcMessage struct {
 	Function string `json:"function"`
 }
 
@@ -105,7 +105,7 @@ func (con *Agent) Connect() {
 						delete(handlers, packet.CorrelationId)
 					}
 				} else {
-					request := rpcFunctionRequest{}
+					request := RpcMessage{}
 					err := json.Unmarshal(packet.Body, &request)
 					if err == nil {
 						handler, ok := handlers[request.Function]
@@ -124,15 +124,6 @@ func (con *Agent) Connect() {
 			}
 		}
 	}(rpc_channel, &queue, rpc_chan)
-}
-
-type discoverResponse struct {
-	Alive          bool      `json:"alive"`
-	CurrentTime    time.Time `json:"currentTime"`
-	StartingTime   time.Time `json:"startingTime"`
-	MetricqVersion string    `json:"metricqVersion"`
-	Version        string    `json:"version"`
-	Hostname       string    `json:"hostname"`
 }
 
 func (con *Agent) SendRpcResponse(ctx context.Context, packet amqp.Delivery, payload any) error {
@@ -167,16 +158,25 @@ HandlerLoop:
 	for {
 		select {
 		case packet := <-response_channel:
-            log.Printf("Respond to discover RPC from: %s", packet.AppId)
+			log.Printf("Respond to discover RPC from: %s", packet.AppId)
 
-			err := con.SendRpcResponse(ctx, packet, discoverResponse{
+			response := struct {
+				Alive          bool      `json:"alive"`
+				CurrentTime    time.Time `json:"currentTime"`
+				StartingTime   time.Time `json:"startingTime"`
+				MetricqVersion string    `json:"metricqVersion"`
+				Version        string    `json:"version"`
+				Hostname       string    `json:"hostname"`
+			}{
 				Alive:          true,
 				CurrentTime:    time.Now(),
 				StartingTime:   start_time,
 				MetricqVersion: "metricq-go/0.0.1",
 				Version:        version,
 				Hostname:       hostname,
-			})
+			}
+
+			err := con.SendRpcResponse(ctx, packet, response)
 
 			if err != nil {
 				log.Panicf("Failed to publish rpc response: %s", err)
@@ -198,7 +198,6 @@ func (con *Agent) Rpc(ctx context.Context, exchange, function string, payload an
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Body Contents: %s", data)
 
 	correlationId := makeCorrelationId()
 

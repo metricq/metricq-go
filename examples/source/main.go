@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"log"
 	"math"
 	"time"
 
-	"github.com/alecthomas/kong"
 	metricq "github.com/metricq/metricq-go"
 )
 
@@ -21,43 +21,40 @@ type ExampleSourceMetricMetadata struct {
 	Zebras string `json:"zebras"`
 }
 
-var CLI struct {
-	Server string `help:"MetricQ server URL." default:"amqp://admin:admin@localhost"`
-	Token  string `help:"A token to identify this client on the MetricQ network." default:"source-go-example"`
-}
-
 func main() {
-	cli := kong.Parse(&CLI)
+	server := flag.String("server", "amqp://admin:admin@localhost", "MetricQ server URL")
+	token := flag.String("token", "source-go-example", "A token to identify thiss client on the MetricQ network")
 
-	switch cli.Command() {
-	case "":
-		run_source(CLI.Server, CLI.Token)
-	default:
-		panic(cli.Command())
-	}
+	flag.Parse()
+
+	run_source(*token, *server)
 }
 
-func run_source(server, token string) {
-	src := metricq.Source{
-		Agent: metricq.NewAgent(token, server),
-	}
+func run_source(token, server string) {
+	src := metricq.NewSource(token, server)
 
 	defer src.Close()
 
 	log.Print("Establishing Connection to MetricQ...")
-	src.Connect()
+	err := src.Connect(context.Background())
+	if err != nil {
+		log.Panicf("failed to connect to MetricQ: %v", err)
+	}
 	log.Print("Done.")
 
 	go src.HandleDiscover(context.Background(), "1.0.0")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	resp := src.Register(ctx)
+
+	resp, err := src.Register(ctx)
+	if err != nil {
+		log.Panicf("failed to register source: %v", err)
+	}
 
 	config := new(ExampleSourceConfig)
-	err := json.Unmarshal(resp, config)
-	if err != nil {
-		log.Panicf("Failed to parse Source config: %s", err)
+	if err := json.Unmarshal(resp, config); err != nil {
+		log.Panicf("failed to parse Source config: %v", err)
 	}
 
 	log.Printf("Received config: %s", config)
@@ -78,8 +75,10 @@ func run_source(server, token string) {
 	log.Print("String to send data points")
 
 	for {
-		tp := time.Now().UnixNano()
-		metric.Send(context.Background(), tp, math.Sin(2*math.Pi*float64(tp)/1e10))
+		tp := time.Now()
+		if err := metric.Send(context.Background(), tp, math.Sin(2*math.Pi*float64(tp.UnixNano())/1e10)); err != nil {
+			log.Panicf("failed to send: %v", err)
+		}
 
 		time.Sleep(100 * time.Millisecond)
 	}

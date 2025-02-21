@@ -182,7 +182,7 @@ func (agent *Agent) HandleDiscover(ctx context.Context, version string) {
 	start_time := time.Now()
 	response_channel := make(chan amqp.Delivery)
 
-	agent.RegisterRpcHandler("discover", response_channel)
+	agent.NotifyRPC("discover", response_channel)
 
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -277,9 +277,10 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 	}
 }
 
-// RegisterRpcHandler registers the given channel as the RPC handler for
-// RPC messages with the given `function`.
-func (agent *Agent) RegisterRpcHandler(function string, rpc_response chan<- amqp.Delivery) {
+// NotifyRPC registers the given channel as the RPC handler for
+// RPC messages with the given `function`. Upon receiving an RPC message that
+// matches the given function, the message will be passed to the given channel.
+func (agent *Agent) NotifyRPC(function string, rpc_response chan<- amqp.Delivery) {
 	agent.rpcRequestChannel <- rpcRequest{
 		CorrelationId: function,
 		Response:      rpc_response,

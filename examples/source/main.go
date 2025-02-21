@@ -31,12 +31,15 @@ func main() {
 }
 
 func run_source(token, server string) {
-	src := metricq.NewSource(token, server)
+	src, err := metricq.NewSource(token, server)
+	if err != nil {
+		log.Fatalf("Failed to create source: %s", err)
+	}
 
 	defer src.Close()
 
 	log.Print("Establishing Connection to MetricQ...")
-	err := src.Connect(context.Background())
+	err = src.Connect(context.Background())
 	if err != nil {
 		log.Panicf("failed to connect to MetricQ: %v", err)
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"time"
 
@@ -44,9 +43,9 @@ func (resp *SourceRegisterResponse) parseDataServer(server *url.URL) (*url.URL, 
 		dataServerAddress.Host = server.Host
 	}
 
-    if server.User != nil && dataServerAddress.User == nil {
-        dataServerAddress.User = server.User
-    }
+	if server.User != nil && dataServerAddress.User == nil {
+		dataServerAddress.User = server.User
+	}
 
 	return dataServerAddress, nil
 
@@ -57,8 +56,6 @@ func (src *Source) Register(ctx context.Context) (json.RawMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to send RPC: %w", err)
 	}
-
-	log.Printf("Received RPC response: %s", response)
 
 	data := new(SourceRegisterResponse)
 	err = json.Unmarshal(response, data)
@@ -96,12 +93,11 @@ type MetricDeclareMessage struct {
 }
 
 func (src *Source) DeclareMetrics(ctx context.Context, metrics map[string]interface{}) error {
-	response, err := src.Rpc(ctx, "metricq.management", "source.declare_metrics", MetricDeclareMessage{RpcMessage{"source.declare_metrics"}, metrics})
+	_, err := src.Rpc(ctx, "metricq.management", "source.declare_metrics", MetricDeclareMessage{RpcMessage{"source.declare_metrics"}, metrics})
 	if err != nil {
 		return fmt.Errorf("failed to source.declare_metrics RPC: %w", err)
 	}
 
-	log.Printf("Received RPC response: %s", response)
 	return nil
 }
 
@@ -132,7 +128,7 @@ func (src *Source) Send(ctx context.Context, metric string, chunk *DataChunk) er
 }
 
 func (src *Source) Metric(metric string) *SourceMetric {
-	return &SourceMetric{src: src, name: metric, chunk: DataChunk{}}
+	return &SourceMetric{src: src, name: metric, chunkSize: 1, chunk: DataChunk{}}
 }
 
 type SourceMetric struct {
@@ -143,21 +139,54 @@ type SourceMetric struct {
 	chunk         DataChunk
 }
 
+// Send sends the given data point (a timestamp-value pair) to the metric
+// server. If chunking is enabled, only every chunkSize call will actually
+// send a message.
 func (metric *SourceMetric) Send(ctx context.Context, time time.Time, value float64) error {
 	metric.chunk.TimeDelta = append(metric.chunk.TimeDelta, time.UnixNano()-metric.previous_time)
+	metric.previous_time = time.UnixNano()
 	metric.chunk.Value = append(metric.chunk.Value, value)
 
-	if len(metric.chunk.Value) > metric.chunkSize || metric.chunkSize == 0 {
-		if err := metric.src.Send(ctx, metric.name, &metric.chunk); err != nil {
-			return err
-		}
-		metric.chunk.Reset()
-		metric.previous_time = 0
+	if metric.chunkSize > 0 && len(metric.chunk.Value) >= metric.chunkSize {
+		return metric.Flush(ctx)
 	}
 
 	return nil
 }
 
+// Flush send the currently buffered data points to the server.
+// You only need to call this function, when you disabled chunking, i.e.,
+// called Chunking(0).
+func (metric *SourceMetric) Flush(ctx context.Context) error {
+	if len(metric.chunk.Value) == 0 {
+		return nil
+	}
+
+	if err := metric.src.Send(ctx, metric.name, &metric.chunk); err != nil {
+		return err
+	}
+
+	metric.chunk.Reset()
+	metric.previous_time = 0
+
+	return nil
+}
+
+// Name returns the name of the metric
 func (metric *SourceMetric) Name() string {
 	return metric.name
+}
+
+// Chunking controls the usage of chunking for the metric.
+// Setting it to a value greater than zero enables chunking with the given
+// number as the amount of data points transmitted in one message.
+// Setting it to zero disables chunking, i.e., you have to manually call Flush
+func (metric *SourceMetric) Chunking(newChunkSize int) error {
+	if newChunkSize < 0 {
+		return fmt.Errorf("invalid chunk size: %v", newChunkSize)
+	}
+
+	metric.chunkSize = newChunkSize
+
+	return nil
 }

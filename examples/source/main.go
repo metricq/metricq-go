@@ -75,7 +75,7 @@ func run_source(token, server string) {
 
 	metric := src.Metric("go.dummy.source")
 
-	log.Print("String to send data points")
+	log.Print("Starting to send data points")
 
 	for {
 		tp := time.Now()

@@ -62,8 +62,8 @@ func (resp *SinkSubscribeResponse) parseDataServer(server *url.URL) (*url.URL, e
 	return dataServerAddress, nil
 }
 
-func (sink *Sink) Subscribe(ctx context.Context, metrics []string, expires time.Duration) error {
-	response, err := sink.Rpc(ctx, "metricq.management", "sink.subscribe", SinkSubscribeRequest{RpcMessage{"sink.subscribe"}, metrics})
+func (sink *Sink) Subscribe(requestCtx context.Context, workerContext context.Context, metrics []string, expires time.Duration) error {
+	response, err := sink.Rpc(requestCtx, "metricq.management", "sink.subscribe", SinkSubscribeRequest{RpcMessage{"sink.subscribe"}, metrics})
 	if err != nil {
 		return fmt.Errorf("failed to send RPC: %w", err)
 	}
@@ -89,7 +89,7 @@ func (sink *Sink) Subscribe(ctx context.Context, metrics []string, expires time.
 		if err := sink.dataConsumeLoop(ctx, queue); err != nil {
 			log.Panicf("failed to consume data messages: %v", err)
 		}
-	}(ctx, data.DataQueue)
+	}(workerContext, data.DataQueue)
 
 	return nil
 }
@@ -133,7 +133,7 @@ ConsumeLoop:
 					chunk.Value[i],
 				}
 
-				previous_time += chunk.TimeDelta[i] 
+				previous_time += chunk.TimeDelta[i]
 			}
 
 			packet.Ack(false)

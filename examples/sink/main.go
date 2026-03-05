@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
+	"log/slog"
+	"os"
+	"os/signal"
 	"time"
 
 	metricq "github.com/metricq/metricq-go"
@@ -22,22 +24,47 @@ func main() {
 func run_sink(token, server, metric string) {
 	sink, err := metricq.NewSink(token, server)
 	if err != nil {
-		log.Panicf("falied to create sink: %v", err)
+		slog.Error("failed to create sink", "err", err)
+		panic(err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err = sink.Connect(ctx); err != nil {
-		log.Panicf("failed to connect: %v", err)
+		slog.Error("failed to connect", "err", err)
+		panic(err)
 	}
 	defer sink.Close()
 
-	log.Print("Connected to MetricQ")
+	slog.Info("Connected to MetricQ")
 
-	err = sink.Subscribe(ctx, []string{metric}, time.Hour)
+	runningCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	err = sink.Subscribe(ctx, runningCtx, []string{metric}, time.Hour)
 	if err != nil {
-		log.Panicf("failed to subscribe (%s): %v", metric, err)
+		slog.Error("failed to subscribe", "metric", metric, "err", err)
+		panic(err)
 	}
 
+	measurements := make(chan metricq.MetricDataPoint)
+	if err = sink.NotifyDataPoint(measurements); err != nil {
+		slog.Error("failed to set data point channel", "err", err)
+		panic(err)
+	}
+
+loop:
+	for {
+		select {
+		case datapoint, ok := <-measurements:
+			if !ok {
+				break loop
+			}
+
+			slog.Info("received datapoint", "metric", datapoint.Metric, "value", datapoint.Value, "timestamp", datapoint.Timestamp)
+		case <-runningCtx.Done():
+			break loop
+		}
+	}
 }

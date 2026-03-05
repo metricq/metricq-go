@@ -11,6 +11,7 @@ import (
 
 	uuid "github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"google.golang.org/protobuf/proto"
 )
 
 const defaultHistoryTimeout = 10 * time.Second
@@ -26,16 +27,16 @@ type pendingHistoryResponse struct {
 	duration float64
 }
 
-type HistoryRequestType int64
+type HistoryRequestType = HistoryRequest_RequestType
 
 const (
-	HistoryRequestTypeAggregateTimeline HistoryRequestType = 0
-	HistoryRequestTypeAggregate         HistoryRequestType = 1
-	HistoryRequestTypeLastValue         HistoryRequestType = 2
-	HistoryRequestTypeFlexTimeline      HistoryRequestType = 3
+	HistoryRequestTypeAggregateTimeline = HistoryRequest_AGGREGATE_TIMELINE
+	HistoryRequestTypeAggregate         = HistoryRequest_AGGREGATE
+	HistoryRequestTypeLastValue         = HistoryRequest_LAST_VALUE
+	HistoryRequestTypeFlexTimeline      = HistoryRequest_FLEX_TIMELINE
 )
 
-type HistoryRequest struct {
+type HistoryQuery struct {
 	Metric      string
 	StartTimeNS int64
 	EndTimeNS   int64
@@ -53,7 +54,7 @@ type HistoryAggregate struct {
 	ActiveTime int64
 }
 
-type HistoryResponse struct {
+type HistoryDataResponse struct {
 	Metric    string
 	TimeDelta []int64
 	Values    []float64
@@ -208,9 +209,53 @@ func (c *HistoryClient) handleHistoryMessage(msg amqp.Delivery) {
 	}
 }
 
-func (c *HistoryClient) Request(ctx context.Context, req HistoryRequest) (HistoryResponse, float64, error) {
+func marshalHistoryQuery(req HistoryQuery) ([]byte, error) {
+	wireReq := &HistoryRequest{
+		StartTime:   req.StartTimeNS,
+		EndTime:     req.EndTimeNS,
+		IntervalMax: req.IntervalMax,
+		Type:        req.RequestType,
+	}
+	return proto.Marshal(wireReq)
+}
+
+func unmarshalHistoryDataResponse(payload []byte) (HistoryDataResponse, error) {
+	wireResp := &HistoryResponse{}
+	if err := proto.Unmarshal(payload, wireResp); err != nil {
+		return HistoryDataResponse{}, fmt.Errorf("decode history response: %w", err)
+	}
+
+	out := HistoryDataResponse{
+		Metric:    wireResp.GetMetric(),
+		TimeDelta: append([]int64(nil), wireResp.GetTimeDelta()...),
+		Values:    append([]float64(nil), wireResp.GetValue()...),
+		Error:     wireResp.GetError(),
+	}
+	if aggs := wireResp.GetAggregate(); len(aggs) > 0 {
+		out.Agg = make([]HistoryAggregate, 0, len(aggs))
+		for _, agg := range aggs {
+			if agg == nil {
+				continue
+			}
+			out.Agg = append(out.Agg, HistoryAggregate{
+				Minimum:    agg.GetMinimum(),
+				Maximum:    agg.GetMaximum(),
+				Sum:        agg.GetSum(),
+				Count:      agg.GetCount(),
+				Integral:   agg.GetIntegral(),
+				ActiveTime: agg.GetActiveTime(),
+			})
+		}
+	}
+	return out, nil
+}
+
+func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryDataResponse, float64, error) {
 	correlationID := "mq-history-go-" + uuid.NewString()
-	payload := encodeHistoryRequest(req)
+	payload, err := marshalHistoryQuery(req)
+	if err != nil {
+		return HistoryDataResponse{}, 0, fmt.Errorf("encode history request: %w", err)
+	}
 
 	ch := make(chan pendingHistoryResponse, 1)
 	c.pendingMu.Lock()
@@ -230,7 +275,7 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryRequest) (Histor
 		AppId:         c.agent.token,
 	}
 	if err := c.channel.PublishWithContext(ctx, c.exchange, req.Metric, true, false, msg); err != nil {
-		return HistoryResponse{}, 0, fmt.Errorf("publish history request: %w", err)
+		return HistoryDataResponse{}, 0, fmt.Errorf("publish history request: %w", err)
 	}
 
 	timeout := req.Timeout
@@ -242,13 +287,13 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryRequest) (Histor
 
 	select {
 	case <-ctx.Done():
-		return HistoryResponse{}, 0, ctx.Err()
+		return HistoryDataResponse{}, 0, ctx.Err()
 	case <-timer.C:
-		return HistoryResponse{}, 0, fmt.Errorf("history request timeout")
+		return HistoryDataResponse{}, 0, fmt.Errorf("history request timeout")
 	case response := <-ch:
-		decoded, err := decodeHistoryResponse(response.body)
+		decoded, err := unmarshalHistoryDataResponse(response.body)
 		if err != nil {
-			return HistoryResponse{}, 0, err
+			return HistoryDataResponse{}, 0, err
 		}
 		return decoded, response.duration, nil
 	}

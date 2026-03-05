@@ -1,61 +1,44 @@
 package metricq
 
 import (
-	"math"
 	"testing"
 
-	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 )
 
-func TestEncodeHistoryRequestContainsFields(t *testing.T) {
-	raw := encodeHistoryRequest(HistoryRequest{
+func TestMarshalHistoryQueryContainsFields(t *testing.T) {
+	raw, err := marshalHistoryQuery(HistoryQuery{
 		StartTimeNS: 11,
 		EndTimeNS:   22,
 		IntervalMax: 33,
 		RequestType: HistoryRequestTypeFlexTimeline,
 	})
-
-	values := map[protowire.Number]uint64{}
-	for len(raw) > 0 {
-		num, typ, n := protowire.ConsumeTag(raw)
-		if n < 0 {
-			t.Fatalf("invalid tag")
-		}
-		raw = raw[n:]
-		if typ != protowire.VarintType {
-			t.Fatalf("unexpected type %v", typ)
-		}
-		v, m := protowire.ConsumeVarint(raw)
-		if m < 0 {
-			t.Fatalf("invalid varint")
-		}
-		values[num] = v
-		raw = raw[m:]
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
 	}
 
-	if values[1] != 11 || values[2] != 22 || values[3] != 33 || values[4] != uint64(HistoryRequestTypeFlexTimeline) {
-		t.Fatalf("unexpected encoded values: %#v", values)
+	decoded := &HistoryRequest{}
+	if err := proto.Unmarshal(raw, decoded); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+
+	if decoded.GetStartTime() != 11 || decoded.GetEndTime() != 22 || decoded.GetIntervalMax() != 33 || decoded.GetType() != HistoryRequestTypeFlexTimeline {
+		t.Fatalf("unexpected decoded values: %+v", decoded)
 	}
 }
 
-func TestDecodeHistoryResponseValues(t *testing.T) {
-	payload := make([]byte, 0)
-	payload = protowire.AppendTag(payload, 1, protowire.BytesType)
-	payload = protowire.AppendString(payload, "metric.values")
+func TestUnmarshalHistoryDataResponseValues(t *testing.T) {
+	wire := &HistoryResponse{
+		Metric:    "metric.values",
+		TimeDelta: []int64{1_000_000, 2_000_000},
+		Value:     []float64{1.5, 2.5},
+	}
+	payload, err := proto.Marshal(wire)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
 
-	td := []byte{}
-	td = protowire.AppendVarint(td, 1_000_000)
-	td = protowire.AppendVarint(td, 2_000_000)
-	payload = protowire.AppendTag(payload, 2, protowire.BytesType)
-	payload = protowire.AppendBytes(payload, td)
-
-	vals := []byte{}
-	vals = protowire.AppendFixed64(vals, math.Float64bits(1.5))
-	vals = protowire.AppendFixed64(vals, math.Float64bits(2.5))
-	payload = protowire.AppendTag(payload, 7, protowire.BytesType)
-	payload = protowire.AppendBytes(payload, vals)
-
-	decoded, err := decodeHistoryResponse(payload)
+	decoded, err := unmarshalHistoryDataResponse(payload)
 	if err != nil {
 		t.Fatalf("unexpected decode error: %v", err)
 	}
@@ -70,34 +53,25 @@ func TestDecodeHistoryResponseValues(t *testing.T) {
 	}
 }
 
-func TestDecodeHistoryResponseAggregates(t *testing.T) {
-	payload := make([]byte, 0)
-	payload = protowire.AppendTag(payload, 1, protowire.BytesType)
-	payload = protowire.AppendString(payload, "metric.agg")
+func TestUnmarshalHistoryDataResponseAggregates(t *testing.T) {
+	wire := &HistoryResponse{
+		Metric:    "metric.agg",
+		TimeDelta: []int64{1_000_000},
+		Aggregate: []*HistoryResponse_Aggregate{{
+			Minimum:    1,
+			Maximum:    3,
+			Sum:        8,
+			Count:      4,
+			Integral:   123,
+			ActiveTime: 456,
+		}},
+	}
+	payload, err := proto.Marshal(wire)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
 
-	td := []byte{}
-	td = protowire.AppendVarint(td, 1_000_000)
-	payload = protowire.AppendTag(payload, 2, protowire.BytesType)
-	payload = protowire.AppendBytes(payload, td)
-
-	agg := []byte{}
-	agg = protowire.AppendTag(agg, 1, protowire.Fixed64Type)
-	agg = protowire.AppendFixed64(agg, math.Float64bits(1))
-	agg = protowire.AppendTag(agg, 2, protowire.Fixed64Type)
-	agg = protowire.AppendFixed64(agg, math.Float64bits(3))
-	agg = protowire.AppendTag(agg, 3, protowire.Fixed64Type)
-	agg = protowire.AppendFixed64(agg, math.Float64bits(8))
-	agg = protowire.AppendTag(agg, 4, protowire.VarintType)
-	agg = protowire.AppendVarint(agg, 4)
-	agg = protowire.AppendTag(agg, 5, protowire.Fixed64Type)
-	agg = protowire.AppendFixed64(agg, math.Float64bits(123))
-	agg = protowire.AppendTag(agg, 6, protowire.VarintType)
-	agg = protowire.AppendVarint(agg, 456)
-
-	payload = protowire.AppendTag(payload, 6, protowire.BytesType)
-	payload = protowire.AppendBytes(payload, agg)
-
-	decoded, err := decodeHistoryResponse(payload)
+	decoded, err := unmarshalHistoryDataResponse(payload)
 	if err != nil {
 		t.Fatalf("unexpected decode error: %v", err)
 	}

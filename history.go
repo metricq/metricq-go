@@ -1,0 +1,272 @@
+package metricq
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strconv"
+	"sync"
+	"time"
+
+	uuid "github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
+)
+
+const defaultHistoryTimeout = 10 * time.Second
+
+type historyRegisterResponse struct {
+	DataServerAddress string `json:"dataServerAddress"`
+	HistoryExchange   string `json:"historyExchange"`
+	HistoryQueue      string `json:"historyQueue"`
+}
+
+type pendingHistoryResponse struct {
+	body     []byte
+	duration float64
+}
+
+type HistoryRequestType int64
+
+const (
+	HistoryRequestTypeAggregateTimeline HistoryRequestType = 0
+	HistoryRequestTypeAggregate         HistoryRequestType = 1
+	HistoryRequestTypeLastValue         HistoryRequestType = 2
+	HistoryRequestTypeFlexTimeline      HistoryRequestType = 3
+)
+
+type HistoryRequest struct {
+	Metric      string
+	StartTimeNS int64
+	EndTimeNS   int64
+	IntervalMax int64
+	RequestType HistoryRequestType
+	Timeout     time.Duration
+}
+
+type HistoryAggregate struct {
+	Minimum    float64
+	Maximum    float64
+	Sum        float64
+	Count      uint64
+	Integral   float64
+	ActiveTime int64
+}
+
+type HistoryResponse struct {
+	Metric    string
+	TimeDelta []int64
+	Values    []float64
+	Agg       []HistoryAggregate
+	Error     string
+}
+
+type HistoryClient struct {
+	agent *Agent
+
+	conn     *amqp.Connection
+	channel  *amqp.Channel
+	queue    string
+	exchange string
+
+	pendingMu sync.Mutex
+	pending   map[string]chan pendingHistoryResponse
+
+	closeOnce sync.Once
+}
+
+func NewHistoryClient(ctx context.Context, agent *Agent) (*HistoryClient, error) {
+	if agent == nil {
+		return nil, fmt.Errorf("nil agent")
+	}
+	if agent.Server == nil {
+		return nil, fmt.Errorf("agent server is nil")
+	}
+	if agent.connection == nil {
+		return nil, fmt.Errorf("agent is not connected")
+	}
+
+	respBytes, err := agent.Rpc(ctx, "metricq.management", "history.register", RpcMessage{Function: "history.register"})
+	if err != nil {
+		return nil, fmt.Errorf("rpc history.register: %w", err)
+	}
+
+	var reg historyRegisterResponse
+	if err := json.Unmarshal(respBytes, &reg); err != nil {
+		return nil, fmt.Errorf("parse history.register response: %w", err)
+	}
+	if reg.DataServerAddress == "" || reg.HistoryExchange == "" || reg.HistoryQueue == "" {
+		return nil, fmt.Errorf("invalid history.register response")
+	}
+
+	historyURL, err := deriveHistoryDataURL(agent.Server, reg.DataServerAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	historyConn, err := amqp.Dial(historyURL.String())
+	if err != nil {
+		return nil, fmt.Errorf("connect history amqp: %w", err)
+	}
+	historyCh, err := historyConn.Channel()
+	if err != nil {
+		_ = historyConn.Close()
+		return nil, fmt.Errorf("open history channel: %w", err)
+	}
+
+	if _, err := historyCh.QueueDeclarePassive(reg.HistoryQueue, false, false, false, false, nil); err != nil {
+		_ = historyCh.Close()
+		_ = historyConn.Close()
+		return nil, fmt.Errorf("declare passive history queue: %w", err)
+	}
+
+	client := &HistoryClient{
+		agent:    agent,
+		conn:     historyConn,
+		channel:  historyCh,
+		queue:    reg.HistoryQueue,
+		exchange: reg.HistoryExchange,
+		pending:  make(map[string]chan pendingHistoryResponse),
+	}
+	if err := client.startConsumer(ctx); err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+	return client, nil
+}
+
+func deriveHistoryDataURL(baseURL *url.URL, dataServerAddress string) (*url.URL, error) {
+	dataURL, err := url.Parse(dataServerAddress)
+	if err != nil {
+		return nil, err
+	}
+	if dataURL.Scheme == "vhost" {
+		dataURL.Scheme = baseURL.Scheme
+		dataURL.Host = baseURL.Host
+	}
+	if dataURL.User == nil && baseURL.User != nil {
+		dataURL.User = baseURL.User
+	}
+	return dataURL, nil
+}
+
+func (c *HistoryClient) startConsumer(ctx context.Context) error {
+	msgs, err := c.channel.Consume(c.queue, "", false, true, false, false, nil)
+	if err != nil {
+		return fmt.Errorf("consume history queue: %w", err)
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg, ok := <-msgs:
+				if !ok {
+					return
+				}
+				c.handleHistoryMessage(msg)
+			}
+		}
+	}()
+	return nil
+}
+
+func (c *HistoryClient) handleHistoryMessage(msg amqp.Delivery) {
+	defer func() {
+		_ = msg.Ack(false)
+	}()
+	if msg.CorrelationId == "" {
+		return
+	}
+
+	c.pendingMu.Lock()
+	ch, ok := c.pending[msg.CorrelationId]
+	c.pendingMu.Unlock()
+	if !ok {
+		return
+	}
+
+	duration := -1.0
+	if raw, ok := msg.Headers["x-request-duration"]; ok {
+		switch v := raw.(type) {
+		case string:
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+				duration = parsed
+			}
+		case float64:
+			duration = v
+		case int64:
+			duration = float64(v)
+		case int32:
+			duration = float64(v)
+		}
+	}
+
+	select {
+	case ch <- pendingHistoryResponse{body: msg.Body, duration: duration}:
+	default:
+	}
+}
+
+func (c *HistoryClient) Request(ctx context.Context, req HistoryRequest) (HistoryResponse, float64, error) {
+	correlationID := "mq-history-go-" + uuid.NewString()
+	payload := encodeHistoryRequest(req)
+
+	ch := make(chan pendingHistoryResponse, 1)
+	c.pendingMu.Lock()
+	c.pending[correlationID] = ch
+	c.pendingMu.Unlock()
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, correlationID)
+		c.pendingMu.Unlock()
+	}()
+
+	msg := amqp.Publishing{
+		Body:          payload,
+		MessageId:     correlationID,
+		CorrelationId: correlationID,
+		ReplyTo:       c.queue,
+		AppId:         c.agent.token,
+	}
+	if err := c.channel.PublishWithContext(ctx, c.exchange, req.Metric, true, false, msg); err != nil {
+		return HistoryResponse{}, 0, fmt.Errorf("publish history request: %w", err)
+	}
+
+	timeout := req.Timeout
+	if timeout <= 0 {
+		timeout = defaultHistoryTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return HistoryResponse{}, 0, ctx.Err()
+	case <-timer.C:
+		return HistoryResponse{}, 0, fmt.Errorf("history request timeout")
+	case response := <-ch:
+		decoded, err := decodeHistoryResponse(response.body)
+		if err != nil {
+			return HistoryResponse{}, 0, err
+		}
+		return decoded, response.duration, nil
+	}
+}
+
+func (c *HistoryClient) Close() error {
+	var closeErr error
+	c.closeOnce.Do(func() {
+		if c.channel != nil {
+			if err := c.channel.Close(); err != nil {
+				closeErr = err
+			}
+		}
+		if c.conn != nil {
+			if err := c.conn.Close(); err != nil && closeErr == nil {
+				closeErr = err
+			}
+		}
+	})
+	return closeErr
+}

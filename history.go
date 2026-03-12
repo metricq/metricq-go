@@ -156,6 +156,27 @@ func (c *HistoryClient) reconnect(ctx context.Context) error {
 		return err
 	}
 
+	c.connMu.Lock()
+	oldCancel := c.consumeCancel
+	oldConn := c.conn
+	oldChannel := c.channel
+	c.consumeCancel = nil
+	c.conn = nil
+	c.channel = nil
+	c.queue = ""
+	c.exchange = ""
+	c.connMu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
+	if oldChannel != nil {
+		_ = oldChannel.Close()
+	}
+	if oldConn != nil {
+		_ = oldConn.Close()
+	}
+
 	historyURL, err := deriveHistoryDataURL(c.agent.Server, reg.DataServerAddress)
 	if err != nil {
 		return err
@@ -186,25 +207,12 @@ func (c *HistoryClient) reconnect(ctx context.Context) error {
 	}
 
 	c.connMu.Lock()
-	oldCancel := c.consumeCancel
-	oldConn := c.conn
-	oldChannel := c.channel
 	c.conn = historyConn
 	c.channel = historyCh
 	c.queue = reg.HistoryQueue
 	c.exchange = reg.HistoryExchange
 	c.consumeCancel = consumeCancel
 	c.connMu.Unlock()
-
-	if oldCancel != nil {
-		oldCancel()
-	}
-	if oldChannel != nil {
-		_ = oldChannel.Close()
-	}
-	if oldConn != nil {
-		_ = oldConn.Close()
-	}
 
 	return nil
 }

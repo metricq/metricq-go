@@ -120,7 +120,7 @@ func (agent *Agent) runRPCConsumeLoop(ctx context.Context, requests <-chan rpcRe
 			reconnectErr := agent.reconnectManagement()
 			if reconnectErr == nil {
 				log.Printf("management RPC connection restored")
-				agent.runReconnectHooks(ctx)
+				go agent.runReconnectHooks(ctx)
 				backoff = 500 * time.Millisecond
 				break
 			}

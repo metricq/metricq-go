@@ -3,10 +3,11 @@ package metricq
 import (
 	"context"
 	"encoding/json"
-    "net/url"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	uuid "github.com/google/uuid"
@@ -20,10 +21,10 @@ type rpcRequest struct {
 }
 
 func NewAgent(token, server string) (*Agent, error) {
-    url, err := url.Parse(server)
-    if err != nil {
-        return nil, err
-    }
+	url, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Agent{
 		token: token, Server: url,
@@ -36,6 +37,7 @@ func NewAgent(token, server string) (*Agent, error) {
 type Agent struct {
 	token             string
 	Server            *url.URL
+	mu                sync.RWMutex
 	connection        *Connection
 	rpcQueue          *amqp.Queue
 	rpcRequestChannel chan<- rpcRequest
@@ -56,56 +58,124 @@ func (agent *Agent) Connect(rpcCtx context.Context) error {
 		return fmt.Errorf("empty token is invalid")
 	}
 
-	agent.connection = new(Connection)
-	err := agent.connection.Connect(agent.Server, fmt.Sprintf("management connection %s", agent.token))
+	connection := new(Connection)
+	err := connection.Connect(agent.Server, fmt.Sprintf("management connection %s", agent.token))
 	if err != nil {
 		return err
 	}
 
-	queue, err := agent.connection.channel.QueueDeclare(agent.token+"-rpc",
-		false, false, true, false, nil)
+	queue, err := agent.setupRPCQueue(connection)
 	if err != nil {
-		return fmt.Errorf("failed to create RPC queue: %w", err)
-	}
-	agent.rpcQueue = &queue
-
-	err = agent.connection.channel.QueueBind(agent.token+"-rpc", agent.token, "metricq.broadcast", false, nil)
-	if err != nil {
-		return fmt.Errorf("failed to bind RPC queue to metricq.broadcast exchange: %w", err)
+		connection.Close()
+		return err
 	}
 
-	rpcRequestChannel := make(chan rpcRequest)
+	rpcRequestChannel := make(chan rpcRequest, 256)
+	agent.mu.Lock()
+	agent.connection = connection
+	agent.rpcQueue = queue
 	agent.rpcRequestChannel = rpcRequestChannel
+	agent.mu.Unlock()
 
 	go func(ctx context.Context, channel <-chan rpcRequest) {
-		if err := agent.rpcConsumeLoop(ctx, channel); err != nil {
-			log.Panicf("failed to consume RPC messages: %v", err)
-		}
+		agent.runRPCConsumeLoop(ctx, channel)
 	}(rpcCtx, rpcRequestChannel)
 
 	return nil
 }
 
+func (agent *Agent) setupRPCQueue(connection *Connection) (*amqp.Queue, error) {
+	queue, err := connection.channel.QueueDeclare(agent.token+"-rpc",
+		false, false, true, false, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create RPC queue: %w", err)
+	}
+	err = connection.channel.QueueBind(agent.token+"-rpc", agent.token, "metricq.broadcast", false, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to bind RPC queue to metricq.broadcast exchange: %w", err)
+	}
+	return &queue, nil
+}
+
+func (agent *Agent) runRPCConsumeLoop(ctx context.Context, requests <-chan rpcRequest) {
+	backoff := 500 * time.Millisecond
+	for {
+		err := agent.rpcConsumeLoop(ctx, requests)
+		if ctx.Err() != nil {
+			return
+		}
+		log.Printf("failed to consume RPC messages: %v", err)
+		if reconnectErr := agent.reconnectManagement(); reconnectErr != nil {
+			log.Printf("failed to reconnect management channel: %v", reconnectErr)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < 8*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func (agent *Agent) reconnectManagement() error {
+	connection := new(Connection)
+	if err := connection.Connect(agent.Server, fmt.Sprintf("management connection %s", agent.token)); err != nil {
+		return err
+	}
+	queue, err := agent.setupRPCQueue(connection)
+	if err != nil {
+		connection.Close()
+		return err
+	}
+
+	agent.mu.Lock()
+	old := agent.connection
+	agent.connection = connection
+	agent.rpcQueue = queue
+	agent.mu.Unlock()
+
+	if old != nil {
+		old.Close()
+	}
+	return nil
+}
+
 func (agent *Agent) rpcConsumeLoop(ctx context.Context, requests <-chan rpcRequest) error {
-	channel, err := agent.connection.connection.Channel()
+	agent.mu.RLock()
+	connection := agent.connection
+	rpcQueue := agent.rpcQueue
+	agent.mu.RUnlock()
+	if connection == nil || connection.connection == nil {
+		return fmt.Errorf("management connection not available")
+	}
+	if rpcQueue == nil {
+		return fmt.Errorf("rpc queue not initialized")
+	}
+
+	channel, err := connection.connection.Channel()
 	if err != nil {
 		return fmt.Errorf("failed to create RPC channel: %w", err)
 	}
 	defer channel.Close()
 
-	consumer, err := channel.Consume(agent.rpcQueue.Name, "", false, true, false, false, nil)
+	consumer, err := channel.Consume(rpcQueue.Name, "", false, true, false, false, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start consuming on rpc queue: %w", err)
 	}
 
-	log.Printf("starting RPC consume on queue %s", agent.rpcQueue.Name)
+	log.Printf("starting RPC consume on queue %s", rpcQueue.Name)
 
 	handlers := make(map[string](rpcRequest))
 
 ConsumeLoop:
 	for {
 		select {
-		case packet := <-consumer:
+		case packet, ok := <-consumer:
+			if !ok {
+				return fmt.Errorf("RPC consume channel closed")
+			}
 			if channel.IsClosed() {
 				return fmt.Errorf("RPC Channel closed. Stopped RPC consume.")
 			}
@@ -139,7 +209,10 @@ ConsumeLoop:
 				packet.Nack(false, true)
 			}
 
-		case request := <-requests:
+		case request, ok := <-requests:
+			if !ok {
+				return nil
+			}
 			// TODO clean up handlers after a timeout
 			// TODO don't overwrite old handlers?
 			handlers[request.CorrelationId] = request
@@ -233,7 +306,13 @@ func makeCorrelationId() string {
 // Payload will be marshalled into JSON.
 // Returns the response body and any errors.
 func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload any) ([]byte, error) {
-	if agent.connection == nil || agent.rpcQueue == nil {
+	agent.mu.RLock()
+	connection := agent.connection
+	rpcQueue := agent.rpcQueue
+	rpcRequestChannel := agent.rpcRequestChannel
+	agent.mu.RUnlock()
+
+	if connection == nil || rpcQueue == nil || rpcRequestChannel == nil {
 		return nil, fmt.Errorf("no connection established.")
 	}
 
@@ -262,9 +341,13 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 		CleanUp:       true,
 	}
 
-	agent.rpcRequestChannel <- rpc_request
+	select {
+	case rpcRequestChannel <- rpc_request:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("timeout while registering RPC handler. Function: %s", function)
+	}
 
-	err = agent.connection.channel.PublishWithContext(ctx, exchange, function, true, false, response)
+	err = connection.channel.PublishWithContext(ctx, exchange, function, true, false, response)
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish RPC message: %w", err)
 	}
@@ -281,6 +364,9 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 // RPC messages with the given `function`. Upon receiving an RPC message that
 // matches the given function, the message will be passed to the given channel.
 func (agent *Agent) NotifyRPC(function string, rpc_response chan<- amqp.Delivery) {
+	if agent.rpcRequestChannel == nil {
+		return
+	}
 	agent.rpcRequestChannel <- rpcRequest{
 		CorrelationId: function,
 		Response:      rpc_response,

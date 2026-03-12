@@ -31,7 +31,7 @@ func main() {
 }
 
 func run_source(token, server string) {
-	src, err := metricq.NewSource(token, server)
+	src, err := metricq.NewSourceFromToken(token, server)
 	if err != nil {
 		log.Fatalf("Failed to create source: %s", err)
 	}

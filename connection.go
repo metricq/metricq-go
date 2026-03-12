@@ -34,16 +34,16 @@ func (con *Connection) Connect(url *url.URL, name string) error {
 		return fmt.Errorf("failed to create connect channel: %w", err)
 	}
 
-    errorHandler := make(chan *amqp.Error)
+	errorHandler := make(chan *amqp.Error)
 
-    channel.NotifyClose(errorHandler)
+	channel.NotifyClose(errorHandler)
 
-    go func() {
-        select {
-        case err := <- errorHandler:
-            log.Printf("Channel closed: %s", err)
-        }
-    }()
+	go func() {
+		select {
+		case err := <-errorHandler:
+			log.Printf("Channel closed: %s", err)
+		}
+	}()
 
 	con.channel = channel
 

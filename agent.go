@@ -41,6 +41,12 @@ type Agent struct {
 	connection        *Connection
 	rpcQueue          *amqp.Queue
 	rpcRequestChannel chan<- rpcRequest
+	reconnectHooks    []reconnectHook
+}
+
+type reconnectHook struct {
+	name string
+	fn   func(context.Context) error
 }
 
 // RpcMessage is the base for RPC messages in MetricQ.
@@ -104,17 +110,30 @@ func (agent *Agent) runRPCConsumeLoop(ctx context.Context, requests <-chan rpcRe
 		if ctx.Err() != nil {
 			return
 		}
-		log.Printf("failed to consume RPC messages: %v", err)
-		if reconnectErr := agent.reconnectManagement(); reconnectErr != nil {
-			log.Printf("failed to reconnect management channel: %v", reconnectErr)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		if backoff < 8*time.Second {
-			backoff *= 2
+
+		log.Printf("management RPC connection lost: %v", err)
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("trying to reconnect management RPC...")
+			reconnectErr := agent.reconnectManagement()
+			if reconnectErr == nil {
+				log.Printf("management RPC connection restored")
+				agent.runReconnectHooks(ctx)
+				backoff = 500 * time.Millisecond
+				break
+			}
+
+			log.Printf("management RPC reconnect failed: %v", reconnectErr)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 8*time.Second {
+				backoff *= 2
+			}
 		}
 	}
 }
@@ -140,6 +159,41 @@ func (agent *Agent) reconnectManagement() error {
 		old.Close()
 	}
 	return nil
+}
+
+func (agent *Agent) runReconnectHooks(parentCtx context.Context) {
+	agent.mu.RLock()
+	hooks := append([]reconnectHook(nil), agent.reconnectHooks...)
+	agent.mu.RUnlock()
+	if len(hooks) == 0 {
+		return
+	}
+
+	for _, hook := range hooks {
+		if hook.fn == nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
+		err := hook.fn(ctx)
+		cancel()
+		if err != nil {
+			log.Printf("reconnect hook %q failed: %v", hook.name, err)
+			continue
+		}
+		log.Printf("reconnect hook %q completed", hook.name)
+	}
+}
+
+func (agent *Agent) RegisterReconnectHook(name string, fn func(context.Context) error) {
+	if fn == nil {
+		return
+	}
+	agent.mu.Lock()
+	agent.reconnectHooks = append(agent.reconnectHooks, reconnectHook{
+		name: name,
+		fn:   fn,
+	})
+	agent.mu.Unlock()
 }
 
 func (agent *Agent) rpcConsumeLoop(ctx context.Context, requests <-chan rpcRequest) error {

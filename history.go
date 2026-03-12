@@ -65,10 +65,13 @@ type HistoryDataResponse struct {
 type HistoryClient struct {
 	agent *Agent
 
+	connMu   sync.RWMutex
 	conn     *amqp.Connection
 	channel  *amqp.Channel
 	queue    string
 	exchange string
+
+	consumeCancel context.CancelFunc
 
 	pendingMu sync.Mutex
 	pending   map[string]chan pendingHistoryResponse
@@ -87,52 +90,15 @@ func NewHistoryClient(ctx context.Context, agent *Agent) (*HistoryClient, error)
 		return nil, fmt.Errorf("agent is not connected")
 	}
 
-	respBytes, err := agent.Rpc(ctx, "metricq.management", "history.register", RpcMessage{Function: "history.register"})
-	if err != nil {
-		return nil, fmt.Errorf("rpc history.register: %w", err)
-	}
-
-	var reg historyRegisterResponse
-	if err := json.Unmarshal(respBytes, &reg); err != nil {
-		return nil, fmt.Errorf("parse history.register response: %w", err)
-	}
-	if reg.DataServerAddress == "" || reg.HistoryExchange == "" || reg.HistoryQueue == "" {
-		return nil, fmt.Errorf("invalid history.register response")
-	}
-
-	historyURL, err := deriveHistoryDataURL(agent.Server, reg.DataServerAddress)
-	if err != nil {
-		return nil, err
-	}
-
-	historyConn, err := amqp.Dial(historyURL.String())
-	if err != nil {
-		return nil, fmt.Errorf("connect history amqp: %w", err)
-	}
-	historyCh, err := historyConn.Channel()
-	if err != nil {
-		_ = historyConn.Close()
-		return nil, fmt.Errorf("open history channel: %w", err)
-	}
-
-	if _, err := historyCh.QueueDeclarePassive(reg.HistoryQueue, false, false, false, false, nil); err != nil {
-		_ = historyCh.Close()
-		_ = historyConn.Close()
-		return nil, fmt.Errorf("declare passive history queue: %w", err)
-	}
-
 	client := &HistoryClient{
-		agent:    agent,
-		conn:     historyConn,
-		channel:  historyCh,
-		queue:    reg.HistoryQueue,
-		exchange: reg.HistoryExchange,
-		pending:  make(map[string]chan pendingHistoryResponse),
+		agent:   agent,
+		pending: make(map[string]chan pendingHistoryResponse),
 	}
-	if err := client.startConsumer(ctx); err != nil {
+	if err := client.reconnect(ctx); err != nil {
 		_ = client.Close()
 		return nil, err
 	}
+	agent.RegisterReconnectHook("history.register", client.reconnect)
 	return client, nil
 }
 
@@ -151,8 +117,83 @@ func deriveHistoryDataURL(baseURL *url.URL, dataServerAddress string) (*url.URL,
 	return dataURL, nil
 }
 
-func (c *HistoryClient) startConsumer(ctx context.Context) error {
-	msgs, err := c.channel.Consume(c.queue, "", false, true, false, false, nil)
+func (c *HistoryClient) registerHistory(ctx context.Context) (historyRegisterResponse, error) {
+	respBytes, err := c.agent.Rpc(ctx, "metricq.management", "history.register", RpcMessage{Function: "history.register"})
+	if err != nil {
+		return historyRegisterResponse{}, fmt.Errorf("rpc history.register: %w", err)
+	}
+
+	var reg historyRegisterResponse
+	if err := json.Unmarshal(respBytes, &reg); err != nil {
+		return historyRegisterResponse{}, fmt.Errorf("parse history.register response: %w", err)
+	}
+	if reg.DataServerAddress == "" || reg.HistoryExchange == "" || reg.HistoryQueue == "" {
+		return historyRegisterResponse{}, fmt.Errorf("invalid history.register response")
+	}
+	return reg, nil
+}
+
+func (c *HistoryClient) reconnect(ctx context.Context) error {
+	reg, err := c.registerHistory(ctx)
+	if err != nil {
+		return err
+	}
+
+	historyURL, err := deriveHistoryDataURL(c.agent.Server, reg.DataServerAddress)
+	if err != nil {
+		return err
+	}
+
+	historyConn, err := amqp.Dial(historyURL.String())
+	if err != nil {
+		return fmt.Errorf("connect history amqp: %w", err)
+	}
+	historyCh, err := historyConn.Channel()
+	if err != nil {
+		_ = historyConn.Close()
+		return fmt.Errorf("open history channel: %w", err)
+	}
+
+	if _, err := historyCh.QueueDeclarePassive(reg.HistoryQueue, false, false, false, false, nil); err != nil {
+		_ = historyCh.Close()
+		_ = historyConn.Close()
+		return fmt.Errorf("declare passive history queue: %w", err)
+	}
+
+	consumeCtx, consumeCancel := context.WithCancel(context.Background())
+	if err := c.startConsumer(consumeCtx, historyCh, reg.HistoryQueue); err != nil {
+		consumeCancel()
+		_ = historyCh.Close()
+		_ = historyConn.Close()
+		return err
+	}
+
+	c.connMu.Lock()
+	oldCancel := c.consumeCancel
+	oldConn := c.conn
+	oldChannel := c.channel
+	c.conn = historyConn
+	c.channel = historyCh
+	c.queue = reg.HistoryQueue
+	c.exchange = reg.HistoryExchange
+	c.consumeCancel = consumeCancel
+	c.connMu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
+	if oldChannel != nil {
+		_ = oldChannel.Close()
+	}
+	if oldConn != nil {
+		_ = oldConn.Close()
+	}
+
+	return nil
+}
+
+func (c *HistoryClient) startConsumer(ctx context.Context, channel *amqp.Channel, queue string) error {
+	msgs, err := channel.Consume(queue, "", false, true, false, false, nil)
 	if err != nil {
 		return fmt.Errorf("consume history queue: %w", err)
 	}
@@ -251,6 +292,15 @@ func unmarshalHistoryDataResponse(payload []byte) (HistoryDataResponse, error) {
 }
 
 func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryDataResponse, float64, error) {
+	c.connMu.RLock()
+	channel := c.channel
+	exchange := c.exchange
+	queue := c.queue
+	c.connMu.RUnlock()
+	if channel == nil {
+		return HistoryDataResponse{}, 0, fmt.Errorf("history client is not connected")
+	}
+
 	correlationID := "mq-history-go-" + uuid.NewString()
 	payload, err := marshalHistoryQuery(req)
 	if err != nil {
@@ -271,10 +321,10 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryD
 		Body:          payload,
 		MessageId:     correlationID,
 		CorrelationId: correlationID,
-		ReplyTo:       c.queue,
+		ReplyTo:       queue,
 		AppId:         c.agent.token,
 	}
-	if err := c.channel.PublishWithContext(ctx, c.exchange, req.Metric, true, false, msg); err != nil {
+	if err := channel.PublishWithContext(ctx, exchange, req.Metric, true, false, msg); err != nil {
 		return HistoryDataResponse{}, 0, fmt.Errorf("publish history request: %w", err)
 	}
 
@@ -302,6 +352,9 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryD
 func (c *HistoryClient) Close() error {
 	var closeErr error
 	c.closeOnce.Do(func() {
+		if c.consumeCancel != nil {
+			c.consumeCancel()
+		}
 		if c.channel != nil {
 			if err := c.channel.Close(); err != nil {
 				closeErr = err

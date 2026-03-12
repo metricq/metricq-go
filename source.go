@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -15,6 +16,9 @@ type Source struct {
 	*Agent
 	connection *Connection
 	exchange   string
+	mu         sync.Mutex
+	registered bool
+	metrics    map[string]interface{}
 }
 
 type SourceRegisterResponse struct {
@@ -24,12 +28,21 @@ type SourceRegisterResponse struct {
 	Error             string          `json:"error,omitempty"`
 }
 
-func NewSource(token, server string) (*Source, error) {
+func NewSource(agent *Agent) (*Source, error) {
+	if agent == nil {
+		return nil, fmt.Errorf("nil agent")
+	}
+	src := &Source{Agent: agent, metrics: map[string]interface{}{}}
+	agent.RegisterReconnectHook("source.register", src.reconnect)
+	return src, nil
+}
+
+func NewSourceFromToken(token, server string) (*Source, error) {
 	agent, err := NewAgent(token, server)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create agent: %w", err)
 	}
-	return &Source{Agent: agent}, nil
+	return NewSource(agent)
 }
 
 func (resp *SourceRegisterResponse) parseDataServer(server *url.URL) (*url.URL, error) {
@@ -67,16 +80,13 @@ func (src *Source) Register(ctx context.Context) (json.RawMessage, error) {
 		return nil, fmt.Errorf("RPC failed: %s", data.Error)
 	}
 
-	src.connection = new(Connection)
-	dataServer, err := data.parseDataServer(src.Server)
-	if err != nil {
+	if err := src.applyRegisterResponse(data); err != nil {
 		return nil, err
 	}
-	err = src.connection.Connect(dataServer, fmt.Sprintf("data connection %s", src.token))
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect data connection: %w", err)
-	}
-	src.exchange = data.DataExchange
+
+	src.mu.Lock()
+	src.registered = true
+	src.mu.Unlock()
 
 	return data.Config, nil
 }
@@ -98,6 +108,64 @@ func (src *Source) DeclareMetrics(ctx context.Context, metrics map[string]interf
 		return fmt.Errorf("failed to source.declare_metrics RPC: %w", err)
 	}
 
+	src.mu.Lock()
+	if src.metrics == nil {
+		src.metrics = map[string]interface{}{}
+	}
+	for name, meta := range metrics {
+		src.metrics[name] = meta
+	}
+	src.mu.Unlock()
+
+	return nil
+}
+
+func (src *Source) applyRegisterResponse(data *SourceRegisterResponse) error {
+	src.mu.Lock()
+	old := src.connection
+	src.connection = new(Connection)
+	src.mu.Unlock()
+
+	dataServer, err := data.parseDataServer(src.Server)
+	if err != nil {
+		return err
+	}
+	if err := src.connection.Connect(dataServer, fmt.Sprintf("data connection %s", src.token)); err != nil {
+		return fmt.Errorf("failed to connect data connection: %w", err)
+	}
+
+	src.mu.Lock()
+	src.exchange = data.DataExchange
+	src.mu.Unlock()
+
+	if old != nil {
+		old.Close()
+	}
+	return nil
+}
+
+func (src *Source) reconnect(ctx context.Context) error {
+	src.mu.Lock()
+	registered := src.registered
+	metrics := make(map[string]interface{}, len(src.metrics))
+	for name, meta := range src.metrics {
+		metrics[name] = meta
+	}
+	src.mu.Unlock()
+
+	if !registered {
+		return nil
+	}
+
+	if _, err := src.Register(ctx); err != nil {
+		return err
+	}
+	if len(metrics) == 0 {
+		return nil
+	}
+	if err := src.DeclareMetrics(ctx, metrics); err != nil {
+		return err
+	}
 	return nil
 }
 

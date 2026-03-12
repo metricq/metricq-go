@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -23,6 +24,11 @@ type Sink struct {
 	connection      *Connection
 	channel         *amqp.Channel
 	dataPointNotify chan<- MetricDataPoint
+	mu              sync.Mutex
+	subscribed      bool
+	workerCtx       context.Context
+	metrics         []string
+	expires         time.Duration
 }
 
 type SinkSubscribeRequest struct {
@@ -41,7 +47,9 @@ func NewSink(token, server string) (*Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create agent: %w", err)
 	}
-	return &Sink{Agent: agent}, nil
+	sink := &Sink{Agent: agent}
+	agent.RegisterReconnectHook("sink.subscribe", sink.reconnect)
+	return sink, nil
 }
 
 func (resp *SinkSubscribeResponse) parseDataServer(server *url.URL) (*url.URL, error) {
@@ -63,6 +71,16 @@ func (resp *SinkSubscribeResponse) parseDataServer(server *url.URL) (*url.URL, e
 }
 
 func (sink *Sink) Subscribe(requestCtx context.Context, workerContext context.Context, metrics []string, expires time.Duration) error {
+	sink.mu.Lock()
+	sink.workerCtx = workerContext
+	sink.metrics = append([]string(nil), metrics...)
+	sink.expires = expires
+	sink.mu.Unlock()
+
+	return sink.subscribeAndConnect(requestCtx, workerContext, metrics)
+}
+
+func (sink *Sink) subscribeAndConnect(requestCtx context.Context, workerContext context.Context, metrics []string) error {
 	response, err := sink.Rpc(requestCtx, "metricq.management", "sink.subscribe", SinkSubscribeRequest{RpcMessage{"sink.subscribe"}, metrics})
 	if err != nil {
 		return fmt.Errorf("failed to send RPC: %w", err)
@@ -85,6 +103,10 @@ func (sink *Sink) Subscribe(requestCtx context.Context, workerContext context.Co
 		return fmt.Errorf("failed to connect data connection: %w", err)
 	}
 
+	sink.mu.Lock()
+	sink.subscribed = true
+	sink.mu.Unlock()
+
 	go func(ctx context.Context, queue string) {
 		if err := sink.dataConsumeLoop(ctx, queue); err != nil {
 			log.Panicf("failed to consume data messages: %v", err)
@@ -92,6 +114,21 @@ func (sink *Sink) Subscribe(requestCtx context.Context, workerContext context.Co
 	}(workerContext, data.DataQueue)
 
 	return nil
+}
+
+func (sink *Sink) reconnect(ctx context.Context) error {
+	sink.mu.Lock()
+	subscribed := sink.subscribed
+	workerCtx := sink.workerCtx
+	metrics := append([]string(nil), sink.metrics...)
+	sink.mu.Unlock()
+	if !subscribed {
+		return nil
+	}
+	if workerCtx == nil || workerCtx.Err() != nil {
+		return nil
+	}
+	return sink.subscribeAndConnect(ctx, workerCtx, metrics)
 }
 
 func (sink *Sink) dataConsumeLoop(ctx context.Context, queue string) error {

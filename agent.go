@@ -165,9 +165,6 @@ func (agent *Agent) runReconnectHooks(parentCtx context.Context) {
 	agent.mu.RLock()
 	hooks := append([]reconnectHook(nil), agent.reconnectHooks...)
 	agent.mu.RUnlock()
-	if len(hooks) == 0 {
-		return
-	}
 
 	for _, hook := range hooks {
 		if hook.fn == nil {
@@ -239,28 +236,48 @@ ConsumeLoop:
 			if ok {
 				log.Printf("Received RPC response for %s from: %s", packet.CorrelationId, packet.AppId)
 
-				handler.Response <- packet
+				delivered := false
+				select {
+				case handler.Response <- packet:
+					delivered = true
+				default:
+					log.Printf("Dropping RPC response for %s: handler channel not ready", packet.CorrelationId)
+				}
 
 				if handler.CleanUp {
 					close(handler.Response)
 					delete(handlers, packet.CorrelationId)
 				}
 
-				packet.Ack(false)
+				if err := packet.Ack(false); err != nil {
+					log.Printf("failed to ack rpc response %s: %v", packet.CorrelationId, err)
+				}
+				if !delivered && !handler.CleanUp {
+					log.Printf("RPC response for %s was not delivered", packet.CorrelationId)
+				}
 			} else {
 				request := RpcMessage{}
 				err := json.Unmarshal(packet.Body, &request)
 				if err == nil {
 					handler, ok := handlers[request.Function]
 					if ok {
-						handler.Response <- packet
-						log.Printf("Received RPC request from: %s", packet.AppId)
+						select {
+						case handler.Response <- packet:
+							log.Printf("Received RPC request from: %s", packet.AppId)
+						default:
+							log.Printf("Dropping RPC request %s from %s: handler channel not ready", request.Function, packet.AppId)
+						}
+						if ackErr := packet.Ack(false); ackErr != nil {
+							log.Printf("failed to ack rpc request %s: %v", request.Function, ackErr)
+						}
 						break
 					}
 				}
 
-				log.Printf("Received unexpected RPC message (%s) from %s: %s", packet.CorrelationId, packet.AppId, packet.Body)
-				packet.Nack(false, true)
+				log.Printf("Received unexpected RPC message (%s) from %s; dropping", packet.CorrelationId, packet.AppId)
+				if ackErr := packet.Ack(false); ackErr != nil {
+					log.Printf("failed to ack unexpected rpc message %s: %v", packet.CorrelationId, ackErr)
+				}
 			}
 
 		case request, ok := <-requests:
@@ -387,7 +404,7 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 		AppId:         agent.token,
 	}
 
-	rpc_request_chan := make(chan amqp.Delivery)
+	rpc_request_chan := make(chan amqp.Delivery, 1)
 
 	rpc_request := rpcRequest{
 		CorrelationId: correlationId,

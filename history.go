@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	uuid "github.com/google/uuid"
@@ -66,6 +69,7 @@ type HistoryClient struct {
 	agent *Agent
 
 	connMu   sync.RWMutex
+	reconnMu sync.Mutex
 	conn     *amqp.Connection
 	channel  *amqp.Channel
 	queue    string
@@ -75,6 +79,9 @@ type HistoryClient struct {
 
 	pendingMu sync.Mutex
 	pending   map[string]chan pendingHistoryResponse
+
+	closed       chan struct{}
+	reconnecting atomic.Bool
 
 	closeOnce sync.Once
 }
@@ -93,6 +100,7 @@ func NewHistoryClient(ctx context.Context, agent *Agent) (*HistoryClient, error)
 	client := &HistoryClient{
 		agent:   agent,
 		pending: make(map[string]chan pendingHistoryResponse),
+		closed:  make(chan struct{}),
 	}
 	if err := client.reconnect(ctx); err != nil {
 		_ = client.Close()
@@ -134,6 +142,15 @@ func (c *HistoryClient) registerHistory(ctx context.Context) (historyRegisterRes
 }
 
 func (c *HistoryClient) reconnect(ctx context.Context) error {
+	c.reconnMu.Lock()
+	defer c.reconnMu.Unlock()
+
+	select {
+	case <-c.closed:
+		return fmt.Errorf("history client closed")
+	default:
+	}
+
 	reg, err := c.registerHistory(ctx)
 	if err != nil {
 		return err
@@ -197,13 +214,22 @@ func (c *HistoryClient) startConsumer(ctx context.Context, channel *amqp.Channel
 	if err != nil {
 		return fmt.Errorf("consume history queue: %w", err)
 	}
+	closeCh := channel.NotifyClose(make(chan *amqp.Error, 1))
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case amqpErr, ok := <-closeCh:
+				if !ok {
+					c.triggerReconnect("history channel closed")
+					return
+				}
+				c.triggerReconnect(fmt.Sprintf("history channel closed: %v", amqpErr))
+				return
 			case msg, ok := <-msgs:
 				if !ok {
+					c.triggerReconnect("history consumer stopped")
 					return
 				}
 				c.handleHistoryMessage(msg)
@@ -211,6 +237,58 @@ func (c *HistoryClient) startConsumer(ctx context.Context, channel *amqp.Channel
 		}
 	}()
 	return nil
+}
+
+func (c *HistoryClient) triggerReconnect(reason string) {
+	select {
+	case <-c.closed:
+		return
+	default:
+	}
+	if !c.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	log.Printf("history connection lost: %s", reason)
+
+	go func() {
+		defer c.reconnecting.Store(false)
+		backoff := 500 * time.Millisecond
+		for {
+			select {
+			case <-c.closed:
+				return
+			default:
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := c.reconnect(ctx)
+			cancel()
+			if err == nil {
+				log.Printf("history connection restored")
+				return
+			}
+			log.Printf("history reconnect failed: %v", err)
+			time.Sleep(backoff)
+			if backoff < 8*time.Second {
+				backoff *= 2
+			}
+		}
+	}()
+}
+
+func isChannelClosedError(err error) bool {
+	msg := strings.ToLower(errorString(err))
+	return strings.Contains(msg, "channel/connection is not open") ||
+		strings.Contains(msg, "channel is not open") ||
+		strings.Contains(msg, "connection is not open") ||
+		strings.Contains(msg, "exception (504)")
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (c *HistoryClient) handleHistoryMessage(msg amqp.Delivery) {
@@ -301,6 +379,13 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryD
 		return HistoryDataResponse{}, 0, fmt.Errorf("history client is not connected")
 	}
 
+	timeout := req.Timeout
+	if timeout <= 0 {
+		timeout = defaultHistoryTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	correlationID := "mq-history-go-" + uuid.NewString()
 	payload, err := marshalHistoryQuery(req)
 	if err != nil {
@@ -324,16 +409,34 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryD
 		ReplyTo:       queue,
 		AppId:         c.agent.token,
 	}
-	if err := channel.PublishWithContext(ctx, exchange, req.Metric, true, false, msg); err != nil {
-		return HistoryDataResponse{}, 0, fmt.Errorf("publish history request: %w", err)
+	publishErr := channel.PublishWithContext(ctx, exchange, req.Metric, true, false, msg)
+	if publishErr != nil {
+		err := publishErr
+		if isChannelClosedError(err) {
+			reconnectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			reconnectErr := c.reconnect(reconnectCtx)
+			cancel()
+			if reconnectErr == nil {
+				c.connMu.RLock()
+				retryChannel := c.channel
+				retryExchange := c.exchange
+				retryQueue := c.queue
+				c.connMu.RUnlock()
+				msg.ReplyTo = retryQueue
+				if retryChannel != nil {
+					if retryErr := retryChannel.PublishWithContext(ctx, retryExchange, req.Metric, true, false, msg); retryErr == nil {
+						err = nil
+					} else {
+						err = retryErr
+					}
+				}
+			}
+			c.triggerReconnect(fmt.Sprintf("history publish failed: %v", err))
+		}
+		if err != nil {
+			return HistoryDataResponse{}, 0, fmt.Errorf("publish history request: %w", err)
+		}
 	}
-
-	timeout := req.Timeout
-	if timeout <= 0 {
-		timeout = defaultHistoryTimeout
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
 
 	select {
 	case <-ctx.Done():
@@ -352,6 +455,7 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryD
 func (c *HistoryClient) Close() error {
 	var closeErr error
 	c.closeOnce.Do(func() {
+		close(c.closed)
 		if c.consumeCancel != nil {
 			c.consumeCancel()
 		}

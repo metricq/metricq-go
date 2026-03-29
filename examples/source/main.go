@@ -45,7 +45,7 @@ func run_source(token, server string) {
 	}
 	log.Print("Done.")
 
-	go src.HandleDiscover(context.Background(), "1.0.0")
+	go src.ServeDiscover(context.Background(), "1.0.0")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

@@ -14,12 +14,6 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type rpcRequest struct {
-	CorrelationId string
-	Response      chan<- amqp.Delivery
-	CleanUp       bool
-}
-
 func NewAgent(token, server string) (*Agent, error) {
 	url, err := url.Parse(server)
 	if err != nil {
@@ -27,7 +21,9 @@ func NewAgent(token, server string) (*Agent, error) {
 	}
 
 	return &Agent{
-		token: token, Server: url,
+		token:   token,
+		Server:  url,
+		pending: make(map[string]chan<- amqp.Delivery),
 	}, nil
 }
 
@@ -35,13 +31,14 @@ func NewAgent(token, server string) (*Agent, error) {
 // It allows to send and receive RPC messages over the established connection.
 // Make sure to call `Connect()` prior to `RPC()`
 type Agent struct {
-	token             string
-	Server            *url.URL
-	mu                sync.RWMutex
-	connection        *Connection
-	rpcQueue          *amqp.Queue
-	rpcRequestChannel chan<- rpcRequest
-	reconnectHooks    []reconnectHook
+	token          string
+	Server         *url.URL
+	mu             sync.RWMutex
+	connection     *Connection
+	rpcQueue       *amqp.Queue
+	pendingMu      sync.Mutex
+	pending        map[string]chan<- amqp.Delivery
+	reconnectHooks []reconnectHook
 }
 
 type reconnectHook struct {
@@ -76,16 +73,12 @@ func (agent *Agent) Connect(rpcCtx context.Context) error {
 		return err
 	}
 
-	rpcRequestChannel := make(chan rpcRequest, 256)
 	agent.mu.Lock()
 	agent.connection = connection
 	agent.rpcQueue = queue
-	agent.rpcRequestChannel = rpcRequestChannel
 	agent.mu.Unlock()
 
-	go func(ctx context.Context, channel <-chan rpcRequest) {
-		agent.runRPCConsumeLoop(ctx, channel)
-	}(rpcCtx, rpcRequestChannel)
+	go agent.runRPCConsumeLoop(rpcCtx)
 
 	return nil
 }
@@ -103,10 +96,10 @@ func (agent *Agent) setupRPCQueue(connection *Connection) (*amqp.Queue, error) {
 	return &queue, nil
 }
 
-func (agent *Agent) runRPCConsumeLoop(ctx context.Context, requests <-chan rpcRequest) {
+func (agent *Agent) runRPCConsumeLoop(ctx context.Context) {
 	backoff := 500 * time.Millisecond
 	for {
-		err := agent.rpcConsumeLoop(ctx, requests)
+		err := agent.rpcConsumeLoop(ctx)
 		if ctx.Err() != nil {
 			return
 		}
@@ -193,7 +186,7 @@ func (agent *Agent) RegisterReconnectHook(name string, fn func(context.Context) 
 	agent.mu.Unlock()
 }
 
-func (agent *Agent) rpcConsumeLoop(ctx context.Context, requests <-chan rpcRequest) error {
+func (agent *Agent) rpcConsumeLoop(ctx context.Context) error {
 	agent.mu.RLock()
 	connection := agent.connection
 	rpcQueue := agent.rpcQueue
@@ -218,8 +211,6 @@ func (agent *Agent) rpcConsumeLoop(ctx context.Context, requests <-chan rpcReque
 
 	log.Printf("starting RPC consume on queue %s", rpcQueue.Name)
 
-	handlers := make(map[string](rpcRequest))
-
 ConsumeLoop:
 	for {
 		select {
@@ -231,62 +222,47 @@ ConsumeLoop:
 				return fmt.Errorf("RPC Channel closed. Stopped RPC consume.")
 			}
 
-			handler, ok := handlers[packet.CorrelationId]
+			agent.pendingMu.Lock()
+			ch, ok := agent.pending[packet.CorrelationId]
+			agent.pendingMu.Unlock()
 
 			if ok {
 				log.Printf("Received RPC response for %s from: %s", packet.CorrelationId, packet.AppId)
-
-				delivered := false
 				select {
-				case handler.Response <- packet:
-					delivered = true
+				case ch <- packet:
 				default:
 					log.Printf("Dropping RPC response for %s: handler channel not ready", packet.CorrelationId)
 				}
-
-				if handler.CleanUp {
-					close(handler.Response)
-					delete(handlers, packet.CorrelationId)
-				}
-
 				if err := packet.Ack(false); err != nil {
 					log.Printf("failed to ack rpc response %s: %v", packet.CorrelationId, err)
 				}
-				if !delivered && !handler.CleanUp {
-					log.Printf("RPC response for %s was not delivered", packet.CorrelationId)
-				}
-			} else {
-				request := RpcMessage{}
-				err := json.Unmarshal(packet.Body, &request)
-				if err == nil {
-					handler, ok := handlers[request.Function]
-					if ok {
-						select {
-						case handler.Response <- packet:
-							log.Printf("Received RPC request from: %s", packet.AppId)
-						default:
-							log.Printf("Dropping RPC request %s from %s: handler channel not ready", request.Function, packet.AppId)
-						}
-						if ackErr := packet.Ack(false); ackErr != nil {
-							log.Printf("failed to ack rpc request %s: %v", request.Function, ackErr)
-						}
-						break
+				continue
+			}
+
+			// Try to dispatch as an incoming RPC request by function name.
+			request := RpcMessage{}
+			if err := json.Unmarshal(packet.Body, &request); err == nil {
+				agent.pendingMu.Lock()
+				ch, ok = agent.pending[request.Function]
+				agent.pendingMu.Unlock()
+				if ok {
+					select {
+					case ch <- packet:
+						log.Printf("Received RPC request from: %s", packet.AppId)
+					default:
+						log.Printf("Dropping RPC request %s from %s: handler channel not ready", request.Function, packet.AppId)
 					}
-				}
-
-				log.Printf("Received unexpected RPC message (%s) from %s; dropping", packet.CorrelationId, packet.AppId)
-				if ackErr := packet.Ack(false); ackErr != nil {
-					log.Printf("failed to ack unexpected rpc message %s: %v", packet.CorrelationId, ackErr)
+					if ackErr := packet.Ack(false); ackErr != nil {
+						log.Printf("failed to ack rpc request %s: %v", request.Function, ackErr)
+					}
+					continue
 				}
 			}
 
-		case request, ok := <-requests:
-			if !ok {
-				return nil
+			log.Printf("Received unexpected RPC message (%s) from %s; dropping", packet.CorrelationId, packet.AppId)
+			if ackErr := packet.Ack(false); ackErr != nil {
+				log.Printf("failed to ack unexpected rpc message %s: %v", packet.CorrelationId, ackErr)
 			}
-			// TODO clean up handlers after a timeout
-			// TODO don't overwrite old handlers?
-			handlers[request.CorrelationId] = request
 
 		case <-ctx.Done():
 			break ConsumeLoop
@@ -300,7 +276,10 @@ ConsumeLoop:
 // `payload` will be Marshalled into JSON.
 // It returns any errors.
 func (agent *Agent) SendRpcResponse(ctx context.Context, rpcRequest amqp.Delivery, payload any) error {
-	if agent.connection == nil {
+	agent.mu.RLock()
+	connection := agent.connection
+	agent.mu.RUnlock()
+	if connection == nil {
 		return fmt.Errorf("no connection established.")
 	}
 
@@ -316,17 +295,17 @@ func (agent *Agent) SendRpcResponse(ctx context.Context, rpcRequest amqp.Deliver
 		AppId:         agent.token,
 	}
 
-	return agent.connection.channel.PublishWithContext(ctx, "", rpcRequest.ReplyTo, true, false, response)
+	return connection.channel.PublishWithContext(ctx, "", rpcRequest.ReplyTo, true, false, response)
 }
 
-// HandleDiscover provides an opt-in to the default responds for discovery RPC
-// requests. Run this method with `go` to opt-in.
-// It will only return once the context is cancelled.
-func (agent *Agent) HandleDiscover(ctx context.Context, version string) {
+// ServeDiscover handles incoming discover RPC requests until ctx is cancelled.
+// Call as a blocking function or with go for background operation.
+func (agent *Agent) ServeDiscover(ctx context.Context, version string) {
 	start_time := time.Now()
 	response_channel := make(chan amqp.Delivery)
 
 	agent.NotifyRPC("discover", response_channel)
+	defer agent.UnregisterRPC("discover")
 
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -380,10 +359,9 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 	agent.mu.RLock()
 	connection := agent.connection
 	rpcQueue := agent.rpcQueue
-	rpcRequestChannel := agent.rpcRequestChannel
 	agent.mu.RUnlock()
 
-	if connection == nil || rpcQueue == nil || rpcRequestChannel == nil {
+	if connection == nil || rpcQueue == nil {
 		return nil, fmt.Errorf("no connection established.")
 	}
 
@@ -395,36 +373,32 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 	}
 
 	correlationId := makeCorrelationId()
+	responseCh := make(chan amqp.Delivery, 1)
 
-	response := amqp.Publishing{
+	agent.pendingMu.Lock()
+	agent.pending[correlationId] = responseCh
+	agent.pendingMu.Unlock()
+	defer func() {
+		agent.pendingMu.Lock()
+		delete(agent.pending, correlationId)
+		agent.pendingMu.Unlock()
+	}()
+
+	msg := amqp.Publishing{
 		ContentType:   "text/plain",
 		CorrelationId: correlationId,
-		ReplyTo:       agent.rpcQueue.Name,
+		ReplyTo:       rpcQueue.Name,
 		Body:          data,
 		AppId:         agent.token,
 	}
 
-	rpc_request_chan := make(chan amqp.Delivery, 1)
-
-	rpc_request := rpcRequest{
-		CorrelationId: correlationId,
-		Response:      rpc_request_chan,
-		CleanUp:       true,
-	}
-
-	select {
-	case rpcRequestChannel <- rpc_request:
-	case <-ctx.Done():
-		return nil, fmt.Errorf("timeout while registering RPC handler. Function: %s", function)
-	}
-
-	err = connection.channel.PublishWithContext(ctx, exchange, function, true, false, response)
+	err = connection.channel.PublishWithContext(ctx, exchange, function, true, false, msg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish RPC message: %w", err)
 	}
 
 	select {
-	case response := <-rpc_request_chan:
+	case response := <-responseCh:
 		return response.Body, nil
 	case <-ctx.Done():
 		return nil, fmt.Errorf("timeout in RPC call. Function: %s", function)
@@ -435,14 +409,16 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 // RPC messages with the given `function`. Upon receiving an RPC message that
 // matches the given function, the message will be passed to the given channel.
 func (agent *Agent) NotifyRPC(function string, rpc_response chan<- amqp.Delivery) {
-	if agent.rpcRequestChannel == nil {
-		return
-	}
-	agent.rpcRequestChannel <- rpcRequest{
-		CorrelationId: function,
-		Response:      rpc_response,
-		CleanUp:       false,
-	}
+	agent.pendingMu.Lock()
+	agent.pending[function] = rpc_response
+	agent.pendingMu.Unlock()
+}
+
+// UnregisterRPC removes the handler previously registered for function via NotifyRPC.
+func (agent *Agent) UnregisterRPC(function string) {
+	agent.pendingMu.Lock()
+	delete(agent.pending, function)
+	agent.pendingMu.Unlock()
 }
 
 // Close closes the connection.

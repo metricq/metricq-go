@@ -57,21 +57,12 @@ func main() {
 	}
 	defer history.Close()
 
-	intervalNS := resolveIntervalMax(fromTS, toTS, *intervalMax, *maxPoints)
-
-	query := metricq.HistoryQuery{
-		Metric:      *metric,
-		StartTimeNS: fromTS.UnixNano(),
-		EndTimeNS:   toTS.UnixNano(),
-		IntervalMax: intervalNS,
-		RequestType: typeValue,
-		Timeout:     *timeout,
-	}
+	interval := resolveIntervalMax(fromTS, toTS, *intervalMax, *maxPoints)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	resp, duration, err := history.Request(ctx, query)
+	resp, err := history.Request(ctx, *metric, fromTS, toTS, interval, typeValue)
 	if err != nil {
 		slog.Error("history query failed", "err", err)
 		os.Exit(1)
@@ -80,7 +71,7 @@ func main() {
 		slog.Warn("history returned error", "error", resp.Error)
 	}
 
-	printSummary(resp, duration)
+	printSummary(resp)
 }
 
 func parseRange(fromRaw, toRaw string) (time.Time, time.Time, error) {
@@ -123,25 +114,24 @@ func parseRequestType(value string) (metricq.HistoryRequestType, error) {
 	}
 }
 
-func resolveIntervalMax(from, to time.Time, explicit time.Duration, maxPoints int) int64 {
+func resolveIntervalMax(from, to time.Time, explicit time.Duration, maxPoints int) time.Duration {
 	if explicit > 0 {
-		return explicit.Nanoseconds()
+		return explicit
 	}
 	if maxPoints <= 0 {
 		maxPoints = 500
 	}
-	span := to.Sub(from)
-	interval := (span / time.Duration(maxPoints)) * 2
+	interval := (to.Sub(from) / time.Duration(maxPoints)) * 2
 	if interval <= 0 {
 		interval = time.Millisecond
 	}
-	return interval.Nanoseconds()
+	return interval
 }
 
-func printSummary(resp metricq.HistoryDataResponse, duration float64) {
+func printSummary(resp metricq.HistoryDataResponse) {
 	slog.Info("history response",
 		"metric", resp.Metric,
-		"db_duration_seconds", duration,
+		"db_duration", resp.Duration,
 		"time_delta_count", len(resp.TimeDelta),
 		"value_count", len(resp.Values),
 		"aggregate_count", len(resp.Agg),

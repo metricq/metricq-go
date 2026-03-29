@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -27,7 +28,7 @@ type historyRegisterResponse struct {
 
 type pendingHistoryResponse struct {
 	body     []byte
-	duration float64
+	duration time.Duration
 }
 
 type HistoryRequestType = HistoryRequest_RequestType
@@ -39,15 +40,6 @@ const (
 	HistoryRequestTypeFlexTimeline      = HistoryRequest_FLEX_TIMELINE
 )
 
-type HistoryQuery struct {
-	Metric      string
-	StartTimeNS int64
-	EndTimeNS   int64
-	IntervalMax int64
-	RequestType HistoryRequestType
-	Timeout     time.Duration
-}
-
 type HistoryAggregate struct {
 	Minimum    float64
 	Maximum    float64
@@ -57,12 +49,31 @@ type HistoryAggregate struct {
 	ActiveTime int64
 }
 
+func (agg *HistoryAggregate) Mean() (float64, error) {
+	if agg.ActiveTime == 0 {
+		return math.NaN(), fmt.Errorf("aggregate has zero active time")
+	}
+
+	return agg.Integral / float64(agg.ActiveTime), nil
+}
+
+func (agg *HistoryAggregate) MeanSum() (float64, error) {
+	if agg.Count == 0 {
+		return math.NaN(), fmt.Errorf("aggregate has zero values")
+	}
+
+	return agg.Sum / float64(agg.Count), nil
+}
+
 type HistoryDataResponse struct {
 	Metric    string
 	TimeDelta []int64
 	Values    []float64
 	Agg       []HistoryAggregate
 	Error     string
+	// Duration is the time the history server spent processing the request.
+	// Zero if the server did not report it.
+	Duration time.Duration
 }
 
 type HistoryClient struct {
@@ -285,18 +296,15 @@ func (c *HistoryClient) triggerReconnect(reason string) {
 }
 
 func isChannelClosedError(err error) bool {
-	msg := strings.ToLower(errorString(err))
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "channel/connection is not open") ||
 		strings.Contains(msg, "channel is not open") ||
 		strings.Contains(msg, "connection is not open") ||
 		strings.Contains(msg, "exception (504)")
-}
-
-func errorString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }
 
 func (c *HistoryClient) handleHistoryMessage(msg amqp.Delivery) {
@@ -314,36 +322,26 @@ func (c *HistoryClient) handleHistoryMessage(msg amqp.Delivery) {
 		return
 	}
 
-	duration := -1.0
+	var dur time.Duration
 	if raw, ok := msg.Headers["x-request-duration"]; ok {
+		var secs float64
 		switch v := raw.(type) {
-		case string:
-			if parsed, err := strconv.ParseFloat(v, 64); err == nil {
-				duration = parsed
-			}
 		case float64:
-			duration = v
+			secs = v
 		case int64:
-			duration = float64(v)
+			secs = float64(v)
 		case int32:
-			duration = float64(v)
+			secs = float64(v)
+		case string:
+			secs, _ = strconv.ParseFloat(v, 64)
 		}
+		dur = time.Duration(secs * float64(time.Second))
 	}
 
 	select {
-	case ch <- pendingHistoryResponse{body: msg.Body, duration: duration}:
+	case ch <- pendingHistoryResponse{body: msg.Body, duration: dur}:
 	default:
 	}
-}
-
-func marshalHistoryQuery(req HistoryQuery) ([]byte, error) {
-	wireReq := &HistoryRequest{
-		StartTime:   req.StartTimeNS,
-		EndTime:     req.EndTimeNS,
-		IntervalMax: req.IntervalMax,
-		Type:        req.RequestType,
-	}
-	return proto.Marshal(wireReq)
 }
 
 func unmarshalHistoryDataResponse(payload []byte) (HistoryDataResponse, error) {
@@ -377,27 +375,25 @@ func unmarshalHistoryDataResponse(payload []byte) (HistoryDataResponse, error) {
 	return out, nil
 }
 
-func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryDataResponse, float64, error) {
+func (c *HistoryClient) Request(ctx context.Context, metric string, start, end time.Time, intervalMax time.Duration, requestType HistoryRequestType) (HistoryDataResponse, error) {
 	c.connMu.RLock()
 	channel := c.channel
 	exchange := c.exchange
 	queue := c.queue
 	c.connMu.RUnlock()
 	if channel == nil {
-		return HistoryDataResponse{}, 0, fmt.Errorf("history client is not connected")
+		return HistoryDataResponse{}, fmt.Errorf("history client is not connected")
 	}
-
-	timeout := req.Timeout
-	if timeout <= 0 {
-		timeout = defaultHistoryTimeout
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
 
 	correlationID := "mq-history-go-" + uuid.NewString()
-	payload, err := marshalHistoryQuery(req)
+	payload, err := proto.Marshal(&HistoryRequest{
+		StartTime:   start.UnixNano(),
+		EndTime:     end.UnixNano(),
+		IntervalMax: int64(intervalMax),
+		Type:        requestType,
+	})
 	if err != nil {
-		return HistoryDataResponse{}, 0, fmt.Errorf("encode history request: %w", err)
+		return HistoryDataResponse{}, fmt.Errorf("encode history request: %w", err)
 	}
 
 	ch := make(chan pendingHistoryResponse, 1)
@@ -417,7 +413,7 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryD
 		ReplyTo:       queue,
 		AppId:         c.agent.token,
 	}
-	publishErr := channel.PublishWithContext(ctx, exchange, req.Metric, true, false, msg)
+	publishErr := channel.PublishWithContext(ctx, exchange, metric, true, false, msg)
 	if publishErr != nil {
 		err := publishErr
 		if isChannelClosedError(err) {
@@ -432,7 +428,7 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryD
 				c.connMu.RUnlock()
 				msg.ReplyTo = retryQueue
 				if retryChannel != nil {
-					if retryErr := retryChannel.PublishWithContext(ctx, retryExchange, req.Metric, true, false, msg); retryErr == nil {
+					if retryErr := retryChannel.PublishWithContext(ctx, retryExchange, metric, true, false, msg); retryErr == nil {
 						err = nil
 					} else {
 						err = retryErr
@@ -442,21 +438,20 @@ func (c *HistoryClient) Request(ctx context.Context, req HistoryQuery) (HistoryD
 			c.triggerReconnect(fmt.Sprintf("history publish failed: %v", err))
 		}
 		if err != nil {
-			return HistoryDataResponse{}, 0, fmt.Errorf("publish history request: %w", err)
+			return HistoryDataResponse{}, fmt.Errorf("publish history request: %w", err)
 		}
 	}
 
 	select {
 	case <-ctx.Done():
-		return HistoryDataResponse{}, 0, ctx.Err()
-	case <-timer.C:
-		return HistoryDataResponse{}, 0, fmt.Errorf("history request timeout")
+		return HistoryDataResponse{}, ctx.Err()
 	case response := <-ch:
 		decoded, err := unmarshalHistoryDataResponse(response.body)
 		if err != nil {
-			return HistoryDataResponse{}, 0, err
+			return HistoryDataResponse{}, err
 		}
-		return decoded, response.duration, nil
+		decoded.Duration = response.duration
+		return decoded, nil
 	}
 }
 

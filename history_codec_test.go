@@ -2,17 +2,15 @@ package metricq
 
 import (
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 )
 
 func TestMarshalHistoryQueryContainsFields(t *testing.T) {
-	raw, err := marshalHistoryQuery(HistoryQuery{
-		StartTimeNS: 11,
-		EndTimeNS:   22,
-		IntervalMax: 33,
-		RequestType: HistoryRequestTypeFlexTimeline,
-	})
+	start := time.Unix(0, 11)
+	end := time.Unix(0, 22)
+	raw, err := marshalHistoryQuery(start, end, 33, HistoryRequestTypeFlexTimeline)
 	if err != nil {
 		t.Fatalf("unexpected marshal error: %v", err)
 	}

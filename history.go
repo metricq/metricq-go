@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -40,41 +39,31 @@ const (
 	HistoryRequestTypeFlexTimeline      = HistoryRequest_FLEX_TIMELINE
 )
 
-type HistoryAggregate struct {
-	Minimum    float64
-	Maximum    float64
-	Sum        float64
-	Count      uint64
-	Integral   float64
-	ActiveTime int64
-}
+// TimelineResult is returned by RequestTimeline.
+// Use a type switch to distinguish between raw values and aggregates:
+//
+//	switch r := result.(type) {
+//	case *TimelineValues:     // raw value series
+//	case *TimelineAggregates: // aggregate series
+//	}
+type TimelineResult interface{ timelineResult() }
 
-func (agg *HistoryAggregate) Mean() (float64, error) {
-	if agg.ActiveTime == 0 {
-		return math.NaN(), fmt.Errorf("aggregate has zero active time")
-	}
-
-	return agg.Integral / float64(agg.ActiveTime), nil
-}
-
-func (agg *HistoryAggregate) MeanSum() (float64, error) {
-	if agg.Count == 0 {
-		return math.NaN(), fmt.Errorf("aggregate has zero values")
-	}
-
-	return agg.Sum / float64(agg.Count), nil
-}
-
-type HistoryDataResponse struct {
-	Metric    string
-	TimeDelta []int64
-	Values    []float64
-	Agg       []HistoryAggregate
-	Error     string
-	// Duration is the time the history server spent processing the request.
-	// Zero if the server did not report it.
+// TimelineValues holds a raw value series returned by a flex timeline request.
+type TimelineValues struct {
+	Times    []time.Time
+	Values   []float64
 	Duration time.Duration
 }
+
+// TimelineAggregates holds an aggregate series returned by a flex timeline request.
+type TimelineAggregates struct {
+	Times    []time.Time
+	Agg      []*HistoryResponse_Aggregate
+	Duration time.Duration
+}
+
+func (*TimelineValues) timelineResult()     {}
+func (*TimelineAggregates) timelineResult() {}
 
 type HistoryClient struct {
 	agent *Agent
@@ -344,45 +333,29 @@ func (c *HistoryClient) handleHistoryMessage(msg amqp.Delivery) {
 	}
 }
 
-func unmarshalHistoryDataResponse(payload []byte) (HistoryDataResponse, error) {
-	wireResp := &HistoryResponse{}
-	if err := proto.Unmarshal(payload, wireResp); err != nil {
-		return HistoryDataResponse{}, fmt.Errorf("decode history response: %w", err)
+// deltasToTimes converts MetricQ's cumulative-delta timestamps to Go time.Time.
+// TimeDelta[0] is the first absolute nanosecond timestamp; each subsequent
+// value is the nanosecond delta from the previous one.
+func deltasToTimes(deltas []int64) []time.Time {
+	times := make([]time.Time, len(deltas))
+	var absNS int64
+	for i, d := range deltas {
+		absNS += d
+		times[i] = time.Unix(0, absNS)
 	}
-
-	out := HistoryDataResponse{
-		Metric:    wireResp.GetMetric(),
-		TimeDelta: append([]int64(nil), wireResp.GetTimeDelta()...),
-		Values:    append([]float64(nil), wireResp.GetValue()...),
-		Error:     wireResp.GetError(),
-	}
-	if aggs := wireResp.GetAggregate(); len(aggs) > 0 {
-		out.Agg = make([]HistoryAggregate, 0, len(aggs))
-		for _, agg := range aggs {
-			if agg == nil {
-				continue
-			}
-			out.Agg = append(out.Agg, HistoryAggregate{
-				Minimum:    agg.GetMinimum(),
-				Maximum:    agg.GetMaximum(),
-				Sum:        agg.GetSum(),
-				Count:      agg.GetCount(),
-				Integral:   agg.GetIntegral(),
-				ActiveTime: agg.GetActiveTime(),
-			})
-		}
-	}
-	return out, nil
+	return times
 }
 
-func (c *HistoryClient) Request(ctx context.Context, metric string, start, end time.Time, intervalMax time.Duration, requestType HistoryRequestType) (HistoryDataResponse, error) {
+// Request sends a low-level history request and returns the raw protobuf
+// response along with the server-reported processing duration.
+func (c *HistoryClient) Request(ctx context.Context, metric string, start, end time.Time, intervalMax time.Duration, requestType HistoryRequestType) (*HistoryResponse, time.Duration, error) {
 	c.connMu.RLock()
 	channel := c.channel
 	exchange := c.exchange
 	queue := c.queue
 	c.connMu.RUnlock()
 	if channel == nil {
-		return HistoryDataResponse{}, fmt.Errorf("history client is not connected")
+		return nil, 0, fmt.Errorf("history client is not connected")
 	}
 
 	correlationID := "mq-history-go-" + uuid.NewString()
@@ -393,7 +366,7 @@ func (c *HistoryClient) Request(ctx context.Context, metric string, start, end t
 		Type:        requestType,
 	})
 	if err != nil {
-		return HistoryDataResponse{}, fmt.Errorf("encode history request: %w", err)
+		return nil, 0, fmt.Errorf("encode history request: %w", err)
 	}
 
 	ch := make(chan pendingHistoryResponse, 1)
@@ -438,21 +411,64 @@ func (c *HistoryClient) Request(ctx context.Context, metric string, start, end t
 			c.triggerReconnect(fmt.Sprintf("history publish failed: %v", err))
 		}
 		if err != nil {
-			return HistoryDataResponse{}, fmt.Errorf("publish history request: %w", err)
+			return nil, 0, fmt.Errorf("publish history request: %w", err)
 		}
 	}
 
 	select {
 	case <-ctx.Done():
-		return HistoryDataResponse{}, ctx.Err()
+		return nil, 0, ctx.Err()
 	case response := <-ch:
-		decoded, err := unmarshalHistoryDataResponse(response.body)
-		if err != nil {
-			return HistoryDataResponse{}, err
+		wireResp := &HistoryResponse{}
+		if err := proto.Unmarshal(response.body, wireResp); err != nil {
+			return nil, 0, fmt.Errorf("decode history response: %w", err)
 		}
-		decoded.Duration = response.duration
-		return decoded, nil
+		return wireResp, response.duration, nil
 	}
+}
+
+// RequestTimeline requests a flex timeline for the given metric and time range.
+// The server decides whether to return raw values or aggregates based on the
+// requested resolution. Use a type switch on the returned TimelineResult to
+// distinguish between *TimelineValues and *TimelineAggregates.
+func (c *HistoryClient) RequestTimeline(ctx context.Context, metric string, start, end time.Time, intervalMax time.Duration) (TimelineResult, error) {
+	resp, dur, err := c.Request(ctx, metric, start, end, intervalMax, HistoryRequestTypeFlexTimeline)
+	if err != nil {
+		return nil, err
+	}
+	times := deltasToTimes(resp.GetTimeDelta())
+	if aggs := resp.GetAggregate(); len(aggs) > 0 {
+		return &TimelineAggregates{Times: times, Agg: aggs, Duration: dur}, nil
+	}
+	return &TimelineValues{Times: times, Values: resp.GetValue(), Duration: dur}, nil
+}
+
+// RequestAggregate requests a single aggregate over the given time range.
+func (c *HistoryClient) RequestAggregate(ctx context.Context, metric string, start, end time.Time) (*HistoryResponse_Aggregate, time.Duration, error) {
+	resp, dur, err := c.Request(ctx, metric, start, end, 0, HistoryRequestTypeAggregate)
+	if err != nil {
+		return nil, 0, err
+	}
+	aggs := resp.GetAggregate()
+	if len(aggs) == 0 {
+		return nil, dur, fmt.Errorf("no aggregate in response")
+	}
+	return aggs[0], dur, nil
+}
+
+// RequestLastValue requests the most recent value for the given metric.
+func (c *HistoryClient) RequestLastValue(ctx context.Context, metric string) (float64, time.Time, time.Duration, error) {
+	now := time.Now()
+	resp, dur, err := c.Request(ctx, metric, now, now, 0, HistoryRequestTypeLastValue)
+	if err != nil {
+		return 0, time.Time{}, 0, err
+	}
+	values := resp.GetValue()
+	deltas := resp.GetTimeDelta()
+	if len(values) == 0 || len(deltas) == 0 {
+		return 0, time.Time{}, dur, fmt.Errorf("no value in response")
+	}
+	return values[0], time.Unix(0, deltas[0]), dur, nil
 }
 
 func (c *HistoryClient) Close() error {

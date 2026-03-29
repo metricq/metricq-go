@@ -19,7 +19,7 @@ func main() {
 	from := flag.String("from", "", "Start timestamp in RFC3339 (default: now-1h)")
 	to := flag.String("to", "", "End timestamp in RFC3339 (default: now)")
 	maxPoints := flag.Int("max-points", 500, "Target max points for flex timeline")
-	requestType := flag.String("request-type", "flex", "One of: flex, aggregate, aggregate-timeline, last")
+	requestType := flag.String("request-type", "flex", "One of: flex, aggregate, last")
 	intervalMax := flag.Duration("interval-max", 0, "Override interval_max directly (default computed from range/max-points)")
 	timeout := flag.Duration("timeout", 10*time.Second, "Request timeout")
 	flag.Parse()
@@ -27,12 +27,6 @@ func main() {
 	fromTS, toTS, err := parseRange(*from, *to)
 	if err != nil {
 		slog.Error("invalid time range", "err", err)
-		os.Exit(1)
-	}
-
-	typeValue, err := parseRequestType(*requestType)
-	if err != nil {
-		slog.Error("invalid request-type", "err", err)
 		os.Exit(1)
 	}
 
@@ -57,21 +51,44 @@ func main() {
 	}
 	defer history.Close()
 
-	interval := resolveIntervalMax(fromTS, toTS, *intervalMax, *maxPoints)
-
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	resp, err := history.Request(ctx, *metric, fromTS, toTS, interval, typeValue)
-	if err != nil {
-		slog.Error("history query failed", "err", err)
+	switch strings.ToLower(strings.TrimSpace(*requestType)) {
+	case "flex", "flex-timeline":
+		interval := resolveIntervalMax(fromTS, toTS, *intervalMax, *maxPoints)
+		result, err := history.RequestTimeline(ctx, *metric, fromTS, toTS, interval)
+		if err != nil {
+			slog.Error("history query failed", "err", err)
+			os.Exit(1)
+		}
+		printTimeline(result)
+
+	case "aggregate", "agg":
+		agg, dur, err := history.RequestAggregate(ctx, *metric, fromTS, toTS)
+		if err != nil {
+			slog.Error("history query failed", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("aggregate",
+			"db_duration", dur,
+			"min", agg.GetMinimum(),
+			"max", agg.GetMaximum(),
+			"count", agg.GetCount(),
+		)
+
+	case "last", "last-value":
+		value, ts, dur, err := history.RequestLastValue(ctx, *metric)
+		if err != nil {
+			slog.Error("history query failed", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("last value", "db_duration", dur, "timestamp", ts, "value", value)
+
+	default:
+		slog.Error("unsupported request-type", "value", *requestType, "supported", "flex, aggregate, last")
 		os.Exit(1)
 	}
-	if resp.Error != "" {
-		slog.Warn("history returned error", "error", resp.Error)
-	}
-
-	printSummary(resp)
 }
 
 func parseRange(fromRaw, toRaw string) (time.Time, time.Time, error) {
@@ -99,21 +116,6 @@ func parseRange(fromRaw, toRaw string) (time.Time, time.Time, error) {
 	return fromTS, toTS, nil
 }
 
-func parseRequestType(value string) (metricq.HistoryRequestType, error) {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "flex", "flex-timeline":
-		return metricq.HistoryRequestTypeFlexTimeline, nil
-	case "aggregate", "agg":
-		return metricq.HistoryRequestTypeAggregate, nil
-	case "aggregate-timeline", "agg-timeline":
-		return metricq.HistoryRequestTypeAggregateTimeline, nil
-	case "last", "last-value":
-		return metricq.HistoryRequestTypeLastValue, nil
-	default:
-		return 0, fmt.Errorf("unsupported request type %q", value)
-	}
-}
-
 func resolveIntervalMax(from, to time.Time, explicit time.Duration, maxPoints int) time.Duration {
 	if explicit > 0 {
 		return explicit
@@ -128,30 +130,25 @@ func resolveIntervalMax(from, to time.Time, explicit time.Duration, maxPoints in
 	return interval
 }
 
-func printSummary(resp metricq.HistoryDataResponse) {
-	slog.Info("history response",
-		"metric", resp.Metric,
-		"db_duration", resp.Duration,
-		"time_delta_count", len(resp.TimeDelta),
-		"value_count", len(resp.Values),
-		"aggregate_count", len(resp.Agg),
-	)
-
-	if len(resp.Values) > 0 {
-		first := resp.Values[0]
-		last := resp.Values[len(resp.Values)-1]
-		slog.Info("values", "first", first, "last", last)
-	}
-	if len(resp.Agg) > 0 {
-		first := resp.Agg[0]
-		last := resp.Agg[len(resp.Agg)-1]
-		slog.Info("aggregates",
-			"first_min", first.Minimum,
-			"first_max", first.Maximum,
-			"first_count", first.Count,
-			"last_min", last.Minimum,
-			"last_max", last.Maximum,
-			"last_count", last.Count,
-		)
+func printTimeline(result metricq.TimelineResult) {
+	switch r := result.(type) {
+	case *metricq.TimelineValues:
+		slog.Info("values timeline", "db_duration", r.Duration, "count", len(r.Values))
+		if len(r.Values) > 0 {
+			slog.Info("values", "first", r.Values[0], "last", r.Values[len(r.Values)-1])
+		}
+	case *metricq.TimelineAggregates:
+		slog.Info("aggregate timeline", "db_duration", r.Duration, "count", len(r.Agg))
+		if len(r.Agg) > 0 {
+			first, last := r.Agg[0], r.Agg[len(r.Agg)-1]
+			slog.Info("aggregates",
+				"first_min", first.GetMinimum(),
+				"first_max", first.GetMaximum(),
+				"first_count", first.GetCount(),
+				"last_min", last.GetMinimum(),
+				"last_max", last.GetMaximum(),
+				"last_count", last.GetCount(),
+			)
+		}
 	}
 }

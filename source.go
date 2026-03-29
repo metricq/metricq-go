@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -14,11 +16,15 @@ import (
 
 type Source struct {
 	*Agent
-	connection *Connection
-	exchange   string
-	mu         sync.Mutex
-	registered bool
-	metrics    map[string]interface{}
+	connection    *Connection
+	exchange      string
+	mu            sync.Mutex
+	registered    bool
+	metrics       map[string]interface{}
+	monitorCancel context.CancelFunc
+	closed        chan struct{}
+	closeOnce     sync.Once
+	reconnecting  atomic.Bool
 }
 
 type SourceRegisterResponse struct {
@@ -32,7 +38,11 @@ func NewSource(agent *Agent) (*Source, error) {
 	if agent == nil {
 		return nil, fmt.Errorf("nil agent")
 	}
-	src := &Source{Agent: agent, metrics: map[string]interface{}{}}
+	src := &Source{
+		Agent:   agent,
+		metrics: map[string]interface{}{},
+		closed:  make(chan struct{}),
+	}
 	agent.RegisterReconnectHook("source.register", src.reconnect)
 	return src, nil
 }
@@ -123,8 +133,14 @@ func (src *Source) DeclareMetrics(ctx context.Context, metrics map[string]interf
 func (src *Source) applyRegisterResponse(data *SourceRegisterResponse) error {
 	src.mu.Lock()
 	old := src.connection
+	oldCancel := src.monitorCancel
 	src.connection = new(Connection)
+	src.monitorCancel = nil
 	src.mu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
 
 	dataServer, err := data.parseDataServer(src.Server)
 	if err != nil {
@@ -141,7 +157,61 @@ func (src *Source) applyRegisterResponse(data *SourceRegisterResponse) error {
 	if old != nil {
 		old.Close()
 	}
+
+	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+	src.mu.Lock()
+	src.monitorCancel = monitorCancel
+	src.mu.Unlock()
+
+	closeCh := src.connection.connection.NotifyClose(make(chan *amqp.Error, 1))
+	go func() {
+		select {
+		case <-monitorCtx.Done():
+		case amqpErr, ok := <-closeCh:
+			if !ok {
+				src.triggerReconnect("source data connection closed")
+			} else {
+				src.triggerReconnect(fmt.Sprintf("source data connection closed: %v", amqpErr))
+			}
+		}
+	}()
+
 	return nil
+}
+
+func (src *Source) triggerReconnect(reason string) {
+	select {
+	case <-src.closed:
+		return
+	default:
+	}
+	if !src.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	log.Printf("source data connection lost: %s", reason)
+	go func() {
+		defer src.reconnecting.Store(false)
+		backoff := 500 * time.Millisecond
+		for {
+			select {
+			case <-src.closed:
+				return
+			default:
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := src.reconnect(ctx)
+			cancel()
+			if err == nil {
+				log.Printf("source data connection restored")
+				return
+			}
+			log.Printf("source reconnect failed: %v", err)
+			time.Sleep(backoff)
+			if backoff < 8*time.Second {
+				backoff *= 2
+			}
+		}
+	}()
 }
 
 func (src *Source) reconnect(ctx context.Context) error {
@@ -180,19 +250,36 @@ func (src *Source) Send(ctx context.Context, metric string, chunk *DataChunk) er
 		Body:        body,
 	}
 
-	// if src.connection.channel.IsClosed() {
-	//     src.connection.channel, err = src.connection.connection.Channel()
-	//     if err != nil {
-	//         return fmt.Errorf("Failed to reopen channel: %v", err)
-	//     }
-	// }
-	//
-	err = src.connection.channel.PublishWithContext(ctx, src.exchange, metric, false, false, packet)
+	src.mu.Lock()
+	conn := src.connection
+	exchange := src.exchange
+	src.mu.Unlock()
+
+	err = conn.channel.PublishWithContext(ctx, exchange, metric, false, false, packet)
 	if err != nil {
+		if isChannelClosedError(err) {
+			src.triggerReconnect(fmt.Sprintf("source publish failed: %v", err))
+		}
 		return fmt.Errorf("failed to publish data message: %w", err)
 	}
 
 	return nil
+}
+
+func (src *Source) Close() {
+	src.closeOnce.Do(func() {
+		close(src.closed)
+		src.mu.Lock()
+		cancel := src.monitorCancel
+		conn := src.connection
+		src.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			conn.Close()
+		}
+	})
 }
 
 func (src *Source) Metric(metric string) *SourceMetric {

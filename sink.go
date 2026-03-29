@@ -7,9 +7,9 @@ import (
 	"log"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -22,13 +22,15 @@ type MetricDataPoint struct {
 type Sink struct {
 	*Agent
 	connection      *Connection
-	channel         *amqp.Channel
 	dataPointNotify chan<- MetricDataPoint
 	mu              sync.Mutex
 	subscribed      bool
 	workerCtx       context.Context
 	metrics         []string
 	expires         time.Duration
+	closed          chan struct{}
+	closeOnce       sync.Once
+	reconnecting    atomic.Bool
 }
 
 type SinkSubscribeRequest struct {
@@ -47,7 +49,10 @@ func NewSink(token, server string) (*Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create agent: %w", err)
 	}
-	sink := &Sink{Agent: agent}
+	sink := &Sink{
+		Agent:  agent,
+		closed: make(chan struct{}),
+	}
 	agent.RegisterReconnectHook("sink.subscribe", sink.reconnect)
 	return sink, nil
 }
@@ -109,11 +114,53 @@ func (sink *Sink) subscribeAndConnect(requestCtx context.Context, workerContext 
 
 	go func(ctx context.Context, queue string) {
 		if err := sink.dataConsumeLoop(ctx, queue); err != nil {
-			log.Panicf("failed to consume data messages: %v", err)
+			sink.triggerReconnect(fmt.Sprintf("data consume loop exited: %v", err))
 		}
 	}(workerContext, data.DataQueue)
 
 	return nil
+}
+
+func (sink *Sink) triggerReconnect(reason string) {
+	select {
+	case <-sink.closed:
+		return
+	default:
+	}
+	if !sink.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	log.Printf("sink data connection lost: %s", reason)
+	go func() {
+		defer sink.reconnecting.Store(false)
+		backoff := 500 * time.Millisecond
+		for {
+			select {
+			case <-sink.closed:
+				return
+			default:
+			}
+			sink.mu.Lock()
+			wCtx := sink.workerCtx
+			sink.mu.Unlock()
+			if wCtx != nil && wCtx.Err() != nil {
+				return
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := sink.reconnect(ctx)
+			cancel()
+			if err == nil {
+				log.Printf("sink data connection restored")
+				return
+			}
+			log.Printf("sink reconnect failed: %v", err)
+			time.Sleep(backoff)
+			if backoff < 8*time.Second {
+				backoff *= 2
+			}
+		}
+	}()
 }
 
 func (sink *Sink) reconnect(ctx context.Context) error {
@@ -148,7 +195,10 @@ func (sink *Sink) dataConsumeLoop(ctx context.Context, queue string) error {
 ConsumeLoop:
 	for {
 		select {
-		case packet := <-consumer:
+		case packet, ok := <-consumer:
+			if !ok {
+				return fmt.Errorf("data consumer channel closed")
+			}
 			if channel.IsClosed() {
 				return fmt.Errorf("Data Channel closed. Stopped data consume.")
 			}
@@ -194,11 +244,14 @@ func (sink *Sink) NotifyDataPoint(channel chan<- MetricDataPoint) error {
 }
 
 func (sink *Sink) Close() error {
-	if sink.channel != nil {
-		return sink.channel.Close()
-	}
-
-	sink.connection.Close()
-
+	sink.closeOnce.Do(func() {
+		close(sink.closed)
+		sink.mu.Lock()
+		conn := sink.connection
+		sink.mu.Unlock()
+		if conn != nil {
+			conn.Close()
+		}
+	})
 	return nil
 }

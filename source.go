@@ -75,7 +75,7 @@ func (resp *SourceRegisterResponse) parseDataServer(server *url.URL) (*url.URL, 
 }
 
 func (src *Source) Register(ctx context.Context) (json.RawMessage, error) {
-	response, err := src.Rpc(ctx, "metricq.management", RpcMessage{"source.register"})
+	response, err := src.Rpc(ctx, "metricq.management", "source.register", RpcMessage{"source.register"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to send RPC: %w", err)
 	}
@@ -113,7 +113,7 @@ type MetricDeclareMessage struct {
 }
 
 func (src *Source) DeclareMetrics(ctx context.Context, metrics map[string]interface{}) error {
-	_, err := src.Rpc(ctx, "metricq.management", MetricDeclareMessage{RpcMessage{"source.declare_metrics"}, metrics})
+	_, err := src.Rpc(ctx, "metricq.management", "source.declare_metrics", MetricDeclareMessage{RpcMessage{"source.declare_metrics"}, metrics})
 	if err != nil {
 		return fmt.Errorf("failed to source.declare_metrics RPC: %w", err)
 	}

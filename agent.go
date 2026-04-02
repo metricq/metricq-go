@@ -48,25 +48,25 @@ type reconnectHook struct {
 
 // RpcMessage is the base for RPC messages in MetricQ.
 // It has the `function` member.
-type RPCRequest interface {
-	RPCFunction() string
-}
-
 type RpcMessage struct {
 	Function string `json:"function"`
 }
 
-func (msg RpcMessage) RPCFunction() string {
-	return msg.Function
+type rpcEnvelope struct {
+	Function string
+	Payload  any
 }
 
-func marshalRPCPayload(payload RPCRequest) ([]byte, error) {
-	function := payload.RPCFunction()
-	if function == "" {
-		return nil, fmt.Errorf("rpc payload function must not be empty")
+func (env rpcEnvelope) MarshalJSON() ([]byte, error) {
+	if env.Function == "" {
+		return nil, fmt.Errorf("rpc function must not be empty")
 	}
 
-	data, err := json.Marshal(payload)
+	if env.Payload == nil {
+		return json.Marshal(RpcMessage{Function: env.Function})
+	}
+
+	data, err := json.Marshal(env.Payload)
 	if err != nil {
 		return nil, err
 	}
@@ -76,17 +76,7 @@ func marshalRPCPayload(payload RPCRequest) ([]byte, error) {
 		return nil, fmt.Errorf("rpc payload must marshal to a JSON object: %w", err)
 	}
 
-	if rawFunction, ok := object["function"]; ok {
-		var payloadFunction string
-		if err := json.Unmarshal(rawFunction, &payloadFunction); err != nil {
-			return nil, fmt.Errorf("rpc payload function must be a string: %w", err)
-		}
-		if payloadFunction != "" && payloadFunction != function {
-			return nil, fmt.Errorf("rpc payload function %q does not match request function %q", payloadFunction, function)
-		}
-	}
-
-	functionData, err := json.Marshal(function)
+	functionData, err := json.Marshal(env.Function)
 	if err != nil {
 		return nil, err
 	}
@@ -398,10 +388,9 @@ func makeCorrelationId() string {
 // `exchange`.
 // Payload will be marshalled into JSON.
 // Returns the response body and any errors.
-func (agent *Agent) Rpc(ctx context.Context, exchange string, payload RPCRequest) ([]byte, error) {
-	function := payload.RPCFunction()
+func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload any) ([]byte, error) {
 	if function == "" {
-		return nil, fmt.Errorf("rpc payload function must not be empty")
+		return nil, fmt.Errorf("rpc function must not be empty")
 	}
 	agent.mu.RLock()
 	connection := agent.connection
@@ -414,7 +403,7 @@ func (agent *Agent) Rpc(ctx context.Context, exchange string, payload RPCRequest
 
 	log.Printf("Sending RPC message: %v", payload)
 
-	data, err := marshalRPCPayload(payload)
+	data, err := json.Marshal(rpcEnvelope{Function: function, Payload: payload})
 	if err != nil {
 		return nil, err
 	}

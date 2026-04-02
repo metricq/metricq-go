@@ -86,7 +86,7 @@ func (sink *Sink) Subscribe(requestCtx context.Context, workerContext context.Co
 }
 
 func (sink *Sink) subscribeAndConnect(requestCtx context.Context, workerContext context.Context, metrics []string) error {
-	response, err := sink.Rpc(requestCtx, "metricq.management", SinkSubscribeRequest{RpcMessage{"sink.subscribe"}, metrics})
+	response, err := sink.Rpc(requestCtx, "metricq.management", "sink.subscribe", SinkSubscribeRequest{RpcMessage{"sink.subscribe"}, metrics})
 	if err != nil {
 		return fmt.Errorf("failed to send RPC: %w", err)
 	}

@@ -126,7 +126,7 @@ func deriveHistoryDataURL(baseURL *url.URL, dataServerAddress string) (*url.URL,
 }
 
 func (c *HistoryClient) registerHistory(ctx context.Context) (historyRegisterResponse, error) {
-	respBytes, err := c.agent.Rpc(ctx, "metricq.management", RpcMessage{Function: "history.register"})
+	respBytes, err := c.agent.Rpc(ctx, "metricq.management", "history.register", RpcMessage{Function: "history.register"})
 	if err != nil {
 		return historyRegisterResponse{}, fmt.Errorf("rpc history.register: %w", err)
 	}

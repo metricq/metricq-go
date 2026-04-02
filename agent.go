@@ -52,6 +52,45 @@ type RpcMessage struct {
 	Function string `json:"function"`
 }
 
+func marshalRPCPayload(function string, payload any) ([]byte, error) {
+	var object map[string]json.RawMessage
+
+	switch value := payload.(type) {
+	case nil:
+		object = make(map[string]json.RawMessage, 1)
+	case json.RawMessage:
+		if err := json.Unmarshal(value, &object); err != nil {
+			return nil, fmt.Errorf("rpc payload must marshal to a JSON object: %w", err)
+		}
+	default:
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &object); err != nil {
+			return nil, fmt.Errorf("rpc payload must marshal to a JSON object: %w", err)
+		}
+	}
+
+	if rawFunction, ok := object["function"]; ok {
+		var payloadFunction string
+		if err := json.Unmarshal(rawFunction, &payloadFunction); err != nil {
+			return nil, fmt.Errorf("rpc payload function must be a string: %w", err)
+		}
+		if payloadFunction != "" && payloadFunction != function {
+			return nil, fmt.Errorf("rpc payload function %q does not match request function %q", payloadFunction, function)
+		}
+	}
+
+	functionData, err := json.Marshal(function)
+	if err != nil {
+		return nil, err
+	}
+	object["function"] = functionData
+
+	return json.Marshal(object)
+}
+
 // Connect established the management connection to the MetricQ cluster.
 // This allows to use the MetricQ RPC protocol. A RPC receiver will run within
 // the passed rpcCtx context; cancel this context to stop the receiver.
@@ -367,7 +406,7 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 
 	log.Printf("Sending RPC message: %v", payload)
 
-	data, err := json.Marshal(payload)
+	data, err := marshalRPCPayload(function, payload)
 	if err != nil {
 		return nil, err
 	}

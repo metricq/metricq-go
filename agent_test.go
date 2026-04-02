@@ -5,9 +5,15 @@ import (
 	"testing"
 )
 
+type rpcTestRequest struct {
+	RpcMessage
+	Query string `json:"query"`
+}
+
 func TestMarshalRPCPayloadInjectsFunction(t *testing.T) {
-	data, err := marshalRPCPayload("metrics.search", map[string]any{
-		"query": "foo",
+	data, err := marshalRPCPayload(rpcTestRequest{
+		RpcMessage: RpcMessage{Function: "metrics.search"},
+		Query:      "foo",
 	})
 	if err != nil {
 		t.Fatalf("marshalRPCPayload returned error: %v", err)
@@ -32,7 +38,7 @@ func TestMarshalRPCPayloadAcceptsMatchingFunction(t *testing.T) {
 		Query string `json:"query"`
 	}
 
-	data, err := marshalRPCPayload("metrics.search", request{
+	data, err := marshalRPCPayload(request{
 		RpcMessage: RpcMessage{Function: "metrics.search"},
 		Query:      "foo",
 	})
@@ -49,21 +55,40 @@ func TestMarshalRPCPayloadAcceptsMatchingFunction(t *testing.T) {
 	}
 }
 
-func TestMarshalRPCPayloadRejectsMismatchedFunction(t *testing.T) {
-	type request struct {
-		RpcMessage
-	}
-
-	_, err := marshalRPCPayload("metrics.search", request{
-		RpcMessage: RpcMessage{Function: "get_metrics"},
-	})
+func TestMarshalRPCPayloadRejectsEmptyFunction(t *testing.T) {
+	_, err := marshalRPCPayload(rpcTestRequest{})
 	if err == nil {
 		t.Fatal("marshalRPCPayload succeeded unexpectedly")
 	}
 }
 
+type rpcMismatchedRequest struct {
+	Function string `json:"function"`
+}
+
+func (req rpcMismatchedRequest) RPCFunction() string {
+	return "metrics.search"
+}
+
+func TestMarshalRPCPayloadRejectsMismatchedFunction(t *testing.T) {
+	_, err := marshalRPCPayload(rpcMismatchedRequest{Function: "get_metrics"})
+	if err == nil {
+		t.Fatal("marshalRPCPayload succeeded unexpectedly")
+	}
+}
+
+type rpcNonObjectRequest struct{}
+
+func (req rpcNonObjectRequest) RPCFunction() string {
+	return "metrics.search"
+}
+
+func (req rpcNonObjectRequest) MarshalJSON() ([]byte, error) {
+	return json.Marshal([]string{"foo"})
+}
+
 func TestMarshalRPCPayloadRejectsNonObject(t *testing.T) {
-	_, err := marshalRPCPayload("metrics.search", []string{"foo"})
+	_, err := marshalRPCPayload(rpcNonObjectRequest{})
 	if err == nil {
 		t.Fatal("marshalRPCPayload succeeded unexpectedly")
 	}

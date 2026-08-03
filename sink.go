@@ -24,6 +24,7 @@ type Sink struct {
 	connection      *Connection
 	dataPointNotify chan<- MetricDataPoint
 	mu              sync.Mutex
+	reconnMu        sync.Mutex
 	subscribed      bool
 	workerCtx       context.Context
 	metrics         []string
@@ -98,7 +99,9 @@ func (sink *Sink) subscribeAndConnect(requestCtx context.Context, workerContext 
 		return fmt.Errorf("failed to parse RPC response: %w", err)
 	}
 
+	sink.mu.Lock()
 	sink.connection = new(Connection)
+	sink.mu.Unlock()
 	dataServer, err := data.parseDataServer(sink.Server)
 	if err != nil {
 		return err
@@ -164,6 +167,29 @@ func (sink *Sink) triggerReconnect(reason string) {
 }
 
 func (sink *Sink) reconnect(ctx context.Context) error {
+	sink.reconnMu.Lock()
+	defer sink.reconnMu.Unlock()
+
+	select {
+	case <-sink.closed:
+		return fmt.Errorf("sink closed")
+	default:
+	}
+
+	// Another reconnect path (the agent's post-management-recovery hook and
+	// this sink's own triggerReconnect loop run independently and can both
+	// end up calling reconnect around the same time) may have already
+	// re-established a healthy connection while we were waiting for
+	// reconnMu. Skip redundant work instead of tearing down a freshly
+	// restored connection and immediately reopening another one.
+	sink.mu.Lock()
+	conn := sink.connection
+	sink.mu.Unlock()
+	if conn != nil && conn.connection != nil && !conn.connection.IsClosed() &&
+		conn.channel != nil && !conn.channel.IsClosed() {
+		return nil
+	}
+
 	sink.mu.Lock()
 	subscribed := sink.subscribed
 	workerCtx := sink.workerCtx

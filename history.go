@@ -151,6 +151,19 @@ func (c *HistoryClient) reconnect(ctx context.Context) error {
 	default:
 	}
 
+	// Another reconnect path (the agent's post-management-recovery hook and
+	// this client's own triggerReconnect loop run independently and can both
+	// end up calling reconnect around the same time) may have already
+	// re-established a healthy connection while we were waiting for
+	// reconnMu. Skip redundant work instead of tearing down a freshly
+	// restored connection and immediately reopening another one.
+	c.connMu.RLock()
+	alreadyHealthy := c.conn != nil && !c.conn.IsClosed() && c.channel != nil && !c.channel.IsClosed()
+	c.connMu.RUnlock()
+	if alreadyHealthy {
+		return nil
+	}
+
 	reg, err := c.registerHistory(ctx)
 	if err != nil {
 		return err
@@ -379,12 +392,23 @@ func (c *HistoryClient) Request(ctx context.Context, metric string, start, end t
 		c.pendingMu.Unlock()
 	}()
 
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline {
+		deadline = time.Now().Add(30 * time.Second)
+	}
+
+	expiration := time.Until(deadline).Milliseconds()
+	if expiration < 0 {
+		expiration = 0
+	}
+
 	msg := amqp.Publishing{
 		Body:          payload,
 		MessageId:     correlationID,
 		CorrelationId: correlationID,
 		ReplyTo:       queue,
 		AppId:         c.agent.token,
+		Expiration:    strconv.FormatInt(expiration, 10),
 	}
 	publishErr := channel.PublishWithContext(ctx, exchange, metric, true, false, msg)
 	if publishErr != nil {

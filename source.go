@@ -19,6 +19,7 @@ type Source struct {
 	connection    *Connection
 	exchange      string
 	mu            sync.Mutex
+	reconnMu      sync.Mutex
 	registered    bool
 	metrics       map[string]interface{}
 	monitorCancel context.CancelFunc
@@ -215,6 +216,29 @@ func (src *Source) triggerReconnect(reason string) {
 }
 
 func (src *Source) reconnect(ctx context.Context) error {
+	src.reconnMu.Lock()
+	defer src.reconnMu.Unlock()
+
+	select {
+	case <-src.closed:
+		return fmt.Errorf("source closed")
+	default:
+	}
+
+	// Another reconnect path (the agent's post-management-recovery hook and
+	// this source's own triggerReconnect loop run independently and can both
+	// end up calling reconnect around the same time) may have already
+	// re-established a healthy connection while we were waiting for
+	// reconnMu. Skip redundant work instead of tearing down a freshly
+	// restored connection and immediately reopening another one.
+	src.mu.Lock()
+	conn := src.connection
+	src.mu.Unlock()
+	if conn != nil && conn.connection != nil && !conn.connection.IsClosed() &&
+		conn.channel != nil && !conn.channel.IsClosed() {
+		return nil
+	}
+
 	src.mu.Lock()
 	registered := src.registered
 	metrics := make(map[string]interface{}, len(src.metrics))

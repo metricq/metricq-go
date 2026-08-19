@@ -1,6 +1,7 @@
 # metricq-go
 
 [![Go](https://github.com/metricq/metricq-go/actions/workflows/go.yml/badge.svg)](https://github.com/metricq/metricq-go/actions/workflows/go.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/metricq/metricq-go.svg)](https://pkg.go.dev/github.com/metricq/metricq-go)
 
 Go client library for [MetricQ](https://github.com/metricq/metricq). It provides
 clients for publishing live data, subscribing to metrics, querying historic
@@ -23,6 +24,10 @@ Import the package as `metricq`:
 ```go
 import metricq "github.com/metricq/metricq-go"
 ```
+
+All clients use `context.Context` for request deadlines and shutdown. Source,
+Sink, History, and Transformer clients automatically restore their management
+and data connections after transient connection loss.
 
 ## Clients
 
@@ -142,9 +147,6 @@ The normal lifecycle is:
 5. Publish individual points through a `TransformerMetric`, or publish a
    `DataChunk` with `Transformer.Send`.
 6. Run `ServeConfig` to accept runtime configuration changes.
-
-Management and data connections are re-established automatically. Application
-contexts still control shutdown and request deadlines.
 
 ### Agent and RPC
 

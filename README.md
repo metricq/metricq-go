@@ -9,7 +9,7 @@ data, implementing transformers, and exchanging management RPCs.
 
 ## Requirements
 
-- Go 1.23 or newer
+- Go 1.26 or newer
 - a MetricQ manager and RabbitMQ server
 - a token configured for the client type being used
 

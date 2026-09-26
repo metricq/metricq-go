@@ -25,8 +25,27 @@ type DBBinding struct {
 type DBHandlers struct {
 	Configure func(context.Context, json.RawMessage) ([]DBBinding, error)
 	Data      func(context.Context, string, *DataChunk) error
+	// DataBatch, when set, replaces Data. It receives the deliveries already
+	// buffered by AMQP prefetch together, so one durability barrier (such as a
+	// single fsync) covers all of them. A batch waits at most 500 µs for further
+	// deliveries. All messages are acknowledged together after it returns nil; an
+	// error leaves the entire batch unacknowledged.
+	DataBatch func(context.Context, []DataMessage) error
 	History   func(context.Context, string, *HistoryRequest) (*HistoryResponse, error)
 }
+
+// DataMessage is one delivery of a DataBatch call.
+type DataMessage struct {
+	Input string
+	Chunk *DataChunk
+}
+
+// maxDataBatchBytes bounds the encoded deliveries handed to one DataBatch call.
+const maxDataBatchBytes = 16 << 20
+
+// dataBatchLinger bounds how long a batch waits for further buffered deliveries.
+const dataBatchLinger = 500 * time.Microsecond
+
 type DBRegisterResponse struct {
 	DataServerAddress string          `json:"dataServerAddress"`
 	DataQueue         string          `json:"dataQueue"`
@@ -37,6 +56,8 @@ type DBRegisterResponse struct {
 type DB struct {
 	*Agent
 	Prefetch int
+	// MaxDataBatch bounds the deliveries per DataBatch call; zero means Prefetch.
+	MaxDataBatch int
 	// HistoryPrefetch is the maximum number of concurrently handled history
 	// requests. Each worker owns a channel with prefetch one so a slow request
 	// cannot monopolize a batch of deliveries.
@@ -112,7 +133,7 @@ func (db *DB) configure(ctx context.Context, raw json.RawMessage, h DBHandlers) 
 // until cancellation or an application ingestion failure. History remains active
 // while Data blocks on a WAL high watermark.
 func (db *DB) Run(ctx context.Context, h DBHandlers) error {
-	if h.Configure == nil || h.Data == nil || h.History == nil || db.Prefetch < 1 || db.HistoryPrefetch < 1 {
+	if h.Configure == nil || (h.Data == nil && h.DataBatch == nil) || h.History == nil || db.Prefetch < 1 || db.HistoryPrefetch < 1 || db.MaxDataBatch < 0 {
 		return fmt.Errorf("invalid database handlers or prefetch")
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -203,7 +224,15 @@ func (db *DB) session(ctx context.Context, reg DBRegisterResponse, h DBHandlers)
 	errors := make(chan error, db.HistoryPrefetch+1)
 	defer func() { cancel(); _ = conn.Close(); wg.Wait() }()
 	wg.Add(1)
-	go func() { defer wg.Done(); errors <- consumeDBData(ctx, deliveries, h.Data) }()
+	if h.DataBatch != nil {
+		limit := db.MaxDataBatch
+		if limit == 0 || limit > db.Prefetch {
+			limit = db.Prefetch
+		}
+		go func() { defer wg.Done(); errors <- consumeDBDataBatches(ctx, deliveries, limit, h.DataBatch) }()
+	} else {
+		go func() { defer wg.Done(); errors <- consumeDBData(ctx, deliveries, h.Data) }()
+	}
 	for worker := 0; worker < db.HistoryPrefetch; worker++ {
 		history, err := conn.Channel()
 		if err != nil {
@@ -254,6 +283,65 @@ func consumeDBData(ctx context.Context, deliveries <-chan amqp.Delivery, handler
 			if err := msg.Ack(false); err != nil {
 				return err
 			}
+		}
+	}
+}
+
+// consumeDBDataBatches takes one delivery, then everything already buffered up
+// to the limits. A multiple ACK of the last delivery covers the whole batch:
+// deliveries are consumed in order and every earlier one is already ACKed.
+func consumeDBDataBatches(ctx context.Context, deliveries <-chan amqp.Delivery, limit int, handler func(context.Context, []DataMessage) error) error {
+	for {
+		var batch []amqp.Delivery
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case msg, ok := <-deliveries:
+			if !ok {
+				return fmt.Errorf("data consumer closed")
+			}
+			batch = append(batch, msg)
+		}
+		size := len(batch[0].Body)
+		closed := false
+		// The AMQP client hands over buffered deliveries through an unbuffered
+		// channel, so it looks empty right after each receive. A short linger
+		// collects what is already prefetched without waiting for new traffic.
+		linger := time.NewTimer(dataBatchLinger)
+	drain:
+		for len(batch) < limit && size < maxDataBatchBytes {
+			select {
+			case msg, ok := <-deliveries:
+				if !ok {
+					closed = true
+					break drain
+				}
+				batch = append(batch, msg)
+				size += len(msg.Body)
+			case <-linger.C:
+				break drain
+			}
+		}
+		linger.Stop()
+		messages := make([]DataMessage, len(batch))
+		for i, msg := range batch {
+			chunk := new(DataChunk)
+			if err := proto.Unmarshal(msg.Body, chunk); err != nil {
+				return &dbApplicationError{fmt.Errorf("invalid DataChunk for %s: %w", msg.RoutingKey, err)}
+			}
+			if len(chunk.Value) != len(chunk.TimeDelta) {
+				return &dbApplicationError{fmt.Errorf("mismatched DataChunk arrays for %s", msg.RoutingKey)}
+			}
+			messages[i] = DataMessage{Input: msg.RoutingKey, Chunk: chunk}
+		}
+		if err := handler(ctx, messages); err != nil {
+			return &dbApplicationError{err}
+		}
+		if err := batch[len(batch)-1].Ack(true); err != nil {
+			return err
+		}
+		if closed {
+			return fmt.Errorf("data consumer closed")
 		}
 	}
 }

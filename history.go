@@ -447,6 +447,9 @@ func (c *HistoryClient) Request(ctx context.Context, metric string, start, end t
 		if err := proto.Unmarshal(response.body, wireResp); err != nil {
 			return nil, 0, fmt.Errorf("decode history response: %w", err)
 		}
+		if wireResp.GetError() != "" {
+			return wireResp, response.duration, fmt.Errorf("history request: %s", wireResp.GetError())
+		}
 		return wireResp, response.duration, nil
 	}
 }

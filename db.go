@@ -126,7 +126,37 @@ func (db *DB) configure(ctx context.Context, raw json.RawMessage, h DBHandlers) 
 	if err != nil {
 		return err
 	}
-	return db.Subscribe(ctx, bindings)
+	subscribeCtx, done := context.WithTimeout(ctx, subscribeTimeout(len(bindings)))
+	defer done()
+	return db.Subscribe(subscribeCtx, bindings)
+}
+
+// subscribeTimeout allows for the manager binding every metric to the data
+// and history queues, one AMQP round trip each (about 25 s for 1500 metrics
+// on a development broker).
+func subscribeTimeout(metrics int) time.Duration {
+	return time.Minute + time.Duration(metrics)*50*time.Millisecond
+}
+
+// subscribeUntilDone repeats a subscription with backoff until it succeeds or
+// ctx ends. A failure does not interrupt consumption: the durable queues keep
+// their bindings from the previous run.
+func subscribeUntilDone(ctx context.Context, metrics int, subscribe func(context.Context) error, backoff time.Duration) {
+	for {
+		attempt, done := context.WithTimeout(ctx, subscribeTimeout(metrics))
+		err := subscribe(attempt)
+		done()
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		log.Printf("db.subscribe of %d metrics failed: %v; retrying in %s", metrics, err, backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, time.Minute)
+	}
 }
 
 // Run owns management/data connections, reconnects transport failures and blocks
@@ -171,12 +201,22 @@ func (db *DB) Run(ctx context.Context, h DBHandlers) error {
 	for ctx.Err() == nil {
 		requestCtx, done := context.WithTimeout(ctx, 30*time.Second)
 		reg, err := db.Register(requestCtx)
+		var bindings []DBBinding
 		if err == nil {
-			err = db.configure(requestCtx, reg.Config, h)
+			db.configMu.Lock()
+			bindings, err = h.Configure(requestCtx, reg.Config)
+			db.configMu.Unlock()
 		}
 		done()
 		if err == nil {
+			// Like the C++ client, consume as soon as the queues exist instead of
+			// waiting for the manager to bind every metric: the durable queues
+			// keep their bindings from the previous run, and a backlog drains
+			// meanwhile. New metrics deliver once their binding exists.
+			subscribeCtx, stopSubscribe := context.WithCancel(ctx)
+			go subscribeUntilDone(subscribeCtx, len(bindings), func(ctx context.Context) error { return db.Subscribe(ctx, bindings) }, time.Second)
 			err = db.session(ctx, reg, h)
+			stopSubscribe()
 		}
 		if f, ok := err.(*dbApplicationError); ok {
 			return f.err

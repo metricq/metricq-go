@@ -146,3 +146,45 @@ func TestDBDataBatchFailureDoesNotAck(t *testing.T) {
 	default:
 	}
 }
+
+func TestSubscribeTimeoutScalesWithMetrics(t *testing.T) {
+	if got := subscribeTimeout(0); got != time.Minute {
+		t.Fatalf("no metrics: %s", got)
+	}
+	if got := subscribeTimeout(1500); got < 2*time.Minute {
+		t.Fatalf("1500 metrics: %s, the manager needs 25-50 s per queue", got)
+	}
+}
+
+func TestSubscribeUntilDoneRetriesUntilSuccess(t *testing.T) {
+	calls := 0
+	subscribeUntilDone(context.Background(), 3, func(ctx context.Context) error {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("subscription without deadline")
+		}
+		calls++
+		if calls < 3 {
+			return errors.New("manager busy")
+		}
+		return nil
+	}, time.Millisecond)
+	if calls != 3 {
+		t.Fatalf("%d attempts", calls)
+	}
+}
+
+func TestSubscribeUntilDoneStopsWithContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		subscribeUntilDone(ctx, 1, func(context.Context) error { return errors.New("down") }, time.Hour)
+		close(done)
+	}()
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retry loop ignored cancellation")
+	}
+}

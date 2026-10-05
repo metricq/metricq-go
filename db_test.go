@@ -188,3 +188,26 @@ func TestSubscribeUntilDoneStopsWithContext(t *testing.T) {
 		t.Fatal("retry loop ignored cancellation")
 	}
 }
+
+func TestOversizedHistoryReplyBecomesError(t *testing.T) {
+	big := &HistoryResponse{Metric: "m"}
+	for i := 0; i < 1000; i++ {
+		big.TimeDelta = append(big.TimeDelta, 40e9)
+		big.Aggregate = append(big.Aggregate, &HistoryResponse_Aggregate{Minimum: 1, Maximum: 2, Sum: 3, Count: 4, Integral: 5, ActiveTime: 6})
+	}
+	full, err := encodeHistoryReply(big, "m", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := encodeHistoryReply(big, "m", len(full)); len(b) != len(full) {
+		t.Fatal("response at the limit was replaced")
+	}
+	b, err := encodeHistoryReply(big, "m", len(full)-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp HistoryResponse
+	if err = proto.Unmarshal(b, &resp); err != nil || resp.Error == "" || len(resp.TimeDelta) != 0 || resp.Metric != "m" {
+		t.Fatalf("oversized response not replaced by an error: %v %+v", err, &resp)
+	}
+}

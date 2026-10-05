@@ -62,15 +62,24 @@ type DB struct {
 	// requests. Each worker owns a channel with prefetch one so a slow request
 	// cannot monopolize a batch of deliveries.
 	HistoryPrefetch int
-	configMu        sync.Mutex
+	// MaxHistoryReplyBytes bounds an encoded history response. RabbitMQ closes
+	// the channel on messages above its max_message_size (16 MiB by default
+	// since 4.0); the unacknowledged request would then be redelivered and end
+	// every session. Larger responses are replaced by an error response.
+	MaxHistoryReplyBytes int
+	configMu             sync.Mutex
 }
+
+// DefaultMaxHistoryReplyBytes leaves headroom below RabbitMQ's default
+// max_message_size of 16 MiB.
+const DefaultMaxHistoryReplyBytes = 15 << 20
 
 func NewDB(token, server string) (*DB, error) {
 	a, err := NewAgent(token, server)
 	if err != nil {
 		return nil, err
 	}
-	return &DB{Agent: a, Prefetch: 400, HistoryPrefetch: 8}, nil
+	return &DB{Agent: a, Prefetch: 400, HistoryPrefetch: 8, MaxHistoryReplyBytes: DefaultMaxHistoryReplyBytes}, nil
 }
 func decodeDBRegistration(b []byte) (DBRegisterResponse, error) {
 	var r DBRegisterResponse
@@ -163,7 +172,7 @@ func subscribeUntilDone(ctx context.Context, metrics int, subscribe func(context
 // until cancellation or an application ingestion failure. History remains active
 // while Data blocks on a WAL high watermark.
 func (db *DB) Run(ctx context.Context, h DBHandlers) error {
-	if h.Configure == nil || (h.Data == nil && h.DataBatch == nil) || h.History == nil || db.Prefetch < 1 || db.HistoryPrefetch < 1 || db.MaxDataBatch < 0 {
+	if h.Configure == nil || (h.Data == nil && h.DataBatch == nil) || h.History == nil || db.Prefetch < 1 || db.HistoryPrefetch < 1 || db.MaxDataBatch < 0 || db.MaxHistoryReplyBytes < 0 {
 		return fmt.Errorf("invalid database handlers or prefetch")
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -232,6 +241,16 @@ func (db *DB) Run(ctx context.Context, h DBHandlers) error {
 		delay = min(delay*2, 8*time.Second)
 	}
 	return ctx.Err()
+}
+
+// encodeHistoryReply marshals a history response, replacing one larger than
+// limit (if positive) by an error response the broker accepts.
+func encodeHistoryReply(resp *HistoryResponse, metric string, limit int) ([]byte, error) {
+	b, err := proto.Marshal(resp)
+	if err != nil || limit <= 0 || len(b) <= limit {
+		return b, err
+	}
+	return proto.Marshal(&HistoryResponse{Metric: metric, Error: fmt.Sprintf("history response of %d bytes exceeds the limit of %d bytes; request a shorter range or a larger interval", len(b), limit)})
 }
 
 type dbApplicationError struct{ err error }
@@ -415,7 +434,7 @@ func (db *DB) consumeHistory(ctx context.Context, ch *amqp.Channel, requests <-c
 			if resp == nil {
 				resp = &HistoryResponse{Metric: msg.RoutingKey, Error: "empty database response"}
 			}
-			b, err := proto.Marshal(resp)
+			b, err := encodeHistoryReply(resp, msg.RoutingKey, db.MaxHistoryReplyBytes)
 			if err != nil {
 				return err
 			}

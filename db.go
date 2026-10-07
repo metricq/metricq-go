@@ -281,7 +281,7 @@ func (db *DB) session(ctx context.Context, reg DBRegisterResponse, h DBHandlers)
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	errors := make(chan error, db.HistoryPrefetch+1)
-	defer func() { cancel(); _ = conn.Close(); wg.Wait() }()
+	defer stopSession(cancel, &wg, func() { _ = conn.Close() }, sessionStopGrace)
 	wg.Add(1)
 	if h.DataBatch != nil {
 		limit := db.MaxDataBatch
@@ -320,6 +320,29 @@ func (db *DB) session(ctx context.Context, reg DBRegisterResponse, h DBHandlers)
 		return err
 	}
 }
+
+// sessionStopGrace bounds how long stopping waits for running handlers.
+const sessionStopGrace = 10 * time.Second
+
+// stopSession ends the consumers before closing the connection: a handler
+// that has made its deliveries durable can still acknowledge them. Closing
+// first loses those ACKs, and the broker redelivers what the database has
+// already stored. A handler that does not return within grace is cut off by
+// the close.
+func stopSession(cancel context.CancelFunc, wg *sync.WaitGroup, closeConn func(), grace time.Duration) {
+	cancel()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+	closeConn()
+	<-done
+}
+
 func consumeDBData(ctx context.Context, deliveries <-chan amqp.Delivery, handler func(context.Context, string, *DataChunk) error) error {
 	for {
 		select {

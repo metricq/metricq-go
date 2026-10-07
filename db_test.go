@@ -3,6 +3,7 @@ package metricq
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -209,5 +210,51 @@ func TestOversizedHistoryReplyBecomesError(t *testing.T) {
 	var resp HistoryResponse
 	if err = proto.Unmarshal(b, &resp); err != nil || resp.Error == "" || len(resp.TimeDelta) != 0 || resp.Metric != "m" {
 		t.Fatalf("oversized response not replaced by an error: %v %+v", err, &resp)
+	}
+}
+
+// A batch made durable while the session stops is still acknowledged, and
+// the connection closes only after its consumer returned.
+func TestStopSessionAcksDurableBatchBeforeClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ack := recordingAck{make(chan [2]uint64, 1)}
+	messages := make(chan amqp.Delivery, 1)
+	b, _ := proto.Marshal(&DataChunk{TimeDelta: []int64{1}, Value: []float64{1}})
+	messages <- amqp.Delivery{Acknowledger: ack, Body: b, RoutingKey: "x", DeliveryTag: 1}
+	entered := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = consumeDBDataBatches(ctx, messages, 1, func(context.Context, []DataMessage) error {
+			close(entered)
+			time.Sleep(50 * time.Millisecond) // the WAL fsync outlasts the stop signal
+			return nil
+		})
+	}()
+	<-entered
+	closed := make(chan struct{})
+	stopSession(cancel, &wg, func() {
+		select {
+		case <-ack.acks:
+		default:
+			t.Error("connection closed before the durable batch was acknowledged")
+		}
+		close(closed)
+	}, time.Second)
+	<-closed
+}
+
+// A handler that does not return is cut off after the grace period.
+func TestStopSessionClosesAfterGrace(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	release := make(chan struct{})
+	go func() { defer wg.Done(); <-release }()
+	start := time.Now()
+	stopSession(cancel, &wg, func() { close(release) }, 30*time.Millisecond)
+	if d := time.Since(start); d < 30*time.Millisecond || d > time.Second {
+		t.Fatalf("stopped after %v", d)
 	}
 }

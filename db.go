@@ -177,7 +177,7 @@ func subscribeUntilDone(ctx context.Context, metrics int, subscribe func(context
 // until cancellation or an application ingestion failure. History remains active
 // while Data blocks on a WAL high watermark.
 func (db *DB) Run(ctx context.Context, h DBHandlers) error {
-	if h.Configure == nil || (h.Data == nil && h.DataBatch == nil) || h.History == nil || db.Prefetch < 1 || db.HistoryPrefetch < 1 || db.MaxDataBatch < 0 || db.MaxHistoryReplyBytes < 0 {
+	if h.Configure == nil || (h.Data == nil && h.DataBatch == nil) || (h.History == nil && h.HistoryEncoded == nil) || db.Prefetch < 1 || db.HistoryPrefetch < 1 || db.MaxDataBatch < 0 || db.MaxHistoryReplyBytes < 0 {
 		return fmt.Errorf("invalid database handlers or prefetch")
 	}
 	ctx, cancel := context.WithCancel(ctx)

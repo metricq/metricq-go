@@ -2,7 +2,9 @@ package metricq
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -273,5 +275,21 @@ func TestHistoryEncodedReplies(t *testing.T) {
 	var resp HistoryResponse
 	if err != nil || proto.Unmarshal(b, &resp) != nil || resp.Error != "disk on fire" || resp.Metric != "m" {
 		t.Fatalf("handler error not replied: %v %+v", err, &resp)
+	}
+}
+
+// Run accepts HistoryEncoded in place of History and still requires one.
+func TestRunValidatesHistoryHandlers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	db, _ := NewDB("db-test", "amqp://localhost")
+	configure := func(context.Context, json.RawMessage) ([]DBBinding, error) { return nil, nil }
+	batch := func(context.Context, []DataMessage) error { return nil }
+	if err := db.Run(ctx, DBHandlers{Configure: configure, DataBatch: batch}); err == nil || !strings.Contains(err.Error(), "invalid database handlers") {
+		t.Fatalf("missing history handler accepted: %v", err)
+	}
+	encoded := func(context.Context, string, *HistoryRequest) ([]byte, error) { return nil, nil }
+	if err := db.Run(ctx, DBHandlers{Configure: configure, DataBatch: batch, HistoryEncoded: encoded}); err != nil && strings.Contains(err.Error(), "invalid database handlers") {
+		t.Fatalf("HistoryEncoded rejected: %v", err)
 	}
 }

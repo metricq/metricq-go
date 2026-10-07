@@ -196,14 +196,15 @@ func TestOversizedHistoryReplyBecomesError(t *testing.T) {
 		big.TimeDelta = append(big.TimeDelta, 40e9)
 		big.Aggregate = append(big.Aggregate, &HistoryResponse_Aggregate{Minimum: 1, Maximum: 2, Sum: 3, Count: 4, Integral: 5, ActiveTime: 6})
 	}
-	full, err := encodeHistoryReply(big, "m", 0)
+	reply := historyReply(DBHandlers{History: func(context.Context, string, *HistoryRequest) (*HistoryResponse, error) { return big, nil }})
+	full, err := reply(context.Background(), "m", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := encodeHistoryReply(big, "m", len(full)); len(b) != len(full) {
+	if b, _ := finishHistoryReply(full, nil, "m", len(full)); len(b) != len(full) {
 		t.Fatal("response at the limit was replaced")
 	}
-	b, err := encodeHistoryReply(big, "m", len(full)-1)
+	b, err := finishHistoryReply(full, nil, "m", len(full)-1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,5 +257,21 @@ func TestStopSessionClosesAfterGrace(t *testing.T) {
 	stopSession(cancel, &wg, func() { close(release) }, 30*time.Millisecond)
 	if d := time.Since(start); d < 30*time.Millisecond || d > time.Second {
 		t.Fatalf("stopped after %v", d)
+	}
+}
+
+// HistoryEncoded replies pass through unchanged; handler errors become error
+// responses.
+func TestHistoryEncodedReplies(t *testing.T) {
+	want, _ := proto.Marshal(&HistoryResponse{Metric: "m", TimeDelta: []int64{1, 2}, Value: []float64{3, 4}})
+	reply := historyReply(DBHandlers{HistoryEncoded: func(context.Context, string, *HistoryRequest) ([]byte, error) { return want, nil }})
+	b, err := reply(context.Background(), "m", nil)
+	if b, err = finishHistoryReply(b, err, "m", 1<<20); err != nil || string(b) != string(want) {
+		t.Fatalf("encoded reply changed: %v", err)
+	}
+	b, err = finishHistoryReply(nil, errors.New("disk on fire"), "m", 1<<20)
+	var resp HistoryResponse
+	if err != nil || proto.Unmarshal(b, &resp) != nil || resp.Error != "disk on fire" || resp.Metric != "m" {
+		t.Fatalf("handler error not replied: %v %+v", err, &resp)
 	}
 }

@@ -32,6 +32,11 @@ type DBHandlers struct {
 	// error leaves the entire batch unacknowledged.
 	DataBatch func(context.Context, []DataMessage) error
 	History   func(context.Context, string, *HistoryRequest) (*HistoryResponse, error)
+	// HistoryEncoded, when set, replaces History. It returns the response
+	// already marshaled, so a database can encode large responses without a
+	// message per point. The size limit and error replies apply as for
+	// History.
+	HistoryEncoded func(context.Context, string, *HistoryRequest) ([]byte, error)
 }
 
 // DataMessage is one delivery of a DataBatch call.
@@ -245,12 +250,33 @@ func (db *DB) Run(ctx context.Context, h DBHandlers) error {
 
 // encodeHistoryReply marshals a history response, replacing one larger than
 // limit (if positive) by an error response the broker accepts.
-func encodeHistoryReply(resp *HistoryResponse, metric string, limit int) ([]byte, error) {
-	b, err := proto.Marshal(resp)
-	if err != nil || limit <= 0 || len(b) <= limit {
-		return b, err
+// finishHistoryReply turns a handler's encoded response into the reply body:
+// a handler error, or a response above limit, becomes an error response.
+func finishHistoryReply(b []byte, err error, metric string, limit int) ([]byte, error) {
+	if err == nil && limit > 0 && len(b) > limit {
+		err = fmt.Errorf("history response of %d bytes exceeds the limit of %d bytes; request a shorter range or a larger interval", len(b), limit)
 	}
-	return proto.Marshal(&HistoryResponse{Metric: metric, Error: fmt.Sprintf("history response of %d bytes exceeds the limit of %d bytes; request a shorter range or a larger interval", len(b), limit)})
+	if err != nil {
+		return proto.Marshal(&HistoryResponse{Metric: metric, Error: err.Error()})
+	}
+	return b, nil
+}
+
+// historyReply encodes the response of History unless HistoryEncoded is set.
+func historyReply(h DBHandlers) func(context.Context, string, *HistoryRequest) ([]byte, error) {
+	if h.HistoryEncoded != nil {
+		return h.HistoryEncoded
+	}
+	return func(ctx context.Context, metric string, req *HistoryRequest) ([]byte, error) {
+		resp, err := h.History(ctx, metric, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp == nil {
+			return nil, fmt.Errorf("empty database response")
+		}
+		return proto.Marshal(resp)
+	}
 }
 
 type dbApplicationError struct{ err error }
@@ -311,7 +337,10 @@ func (db *DB) session(ctx context.Context, reg DBRegisterResponse, h DBHandlers)
 			return err
 		}
 		wg.Add(1)
-		go func() { defer wg.Done(); errors <- db.consumeHistory(ctx, history, requests, confirms, h.History) }()
+		go func() {
+			defer wg.Done()
+			errors <- db.consumeHistory(ctx, history, requests, confirms, historyReply(h))
+		}()
 	}
 	select {
 	case <-ctx.Done():
@@ -427,7 +456,7 @@ func consumeDBDataBatches(ctx context.Context, deliveries <-chan amqp.Delivery, 
 		}
 	}
 }
-func (db *DB) consumeHistory(ctx context.Context, ch *amqp.Channel, requests <-chan amqp.Delivery, confirms <-chan amqp.Confirmation, handler func(context.Context, string, *HistoryRequest) (*HistoryResponse, error)) error {
+func (db *DB) consumeHistory(ctx context.Context, ch *amqp.Channel, requests <-chan amqp.Delivery, confirms <-chan amqp.Confirmation, handler func(context.Context, string, *HistoryRequest) ([]byte, error)) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -445,20 +474,13 @@ func (db *DB) consumeHistory(ctx context.Context, ch *amqp.Channel, requests <-c
 			start := time.Now()
 			req := new(HistoryRequest)
 			err := proto.Unmarshal(msg.Body, req)
-			var resp *HistoryResponse
+			var b []byte
 			queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			if err == nil {
-				resp, err = handler(queryCtx, msg.RoutingKey, req)
+				b, err = handler(queryCtx, msg.RoutingKey, req)
 			}
 			cancel()
-			if err != nil {
-				resp = &HistoryResponse{Metric: msg.RoutingKey, Error: err.Error()}
-			}
-			if resp == nil {
-				resp = &HistoryResponse{Metric: msg.RoutingKey, Error: "empty database response"}
-			}
-			b, err := encodeHistoryReply(resp, msg.RoutingKey, db.MaxHistoryReplyBytes)
-			if err != nil {
+			if b, err = finishHistoryReply(b, err, msg.RoutingKey, db.MaxHistoryReplyBytes); err != nil {
 				return err
 			}
 			err = ch.PublishWithContext(ctx, "", msg.ReplyTo, false, false, amqp.Publishing{ContentType: "application/protobuf", CorrelationId: msg.CorrelationId, AppId: db.token, Body: b, Headers: amqp.Table{"x-request-duration": time.Since(start).Seconds()}})

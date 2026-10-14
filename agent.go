@@ -389,6 +389,13 @@ func makeCorrelationId() string {
 // Payload will be marshalled into JSON.
 // Returns the response body and any errors.
 func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload any) ([]byte, error) {
+	return agent.RpcRoutingKey(ctx, exchange, function, function, payload)
+}
+
+// RpcRoutingKey sends an RPC whose AMQP routing key differs from the MetricQ
+// function name. This is used for direct client RPCs such as a runtime config
+// request routed to <token>-rpc.
+func (agent *Agent) RpcRoutingKey(ctx context.Context, exchange, routingKey, function string, payload any) ([]byte, error) {
 	if function == "" {
 		return nil, fmt.Errorf("rpc function must not be empty")
 	}
@@ -428,7 +435,7 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 		AppId:         agent.token,
 	}
 
-	err = connection.channel.PublishWithContext(ctx, exchange, function, true, false, msg)
+	err = connection.channel.PublishWithContext(ctx, exchange, routingKey, true, false, msg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish RPC message: %w", err)
 	}
@@ -438,6 +445,47 @@ func (agent *Agent) Rpc(ctx context.Context, exchange, function string, payload 
 		return response.Body, nil
 	case <-ctx.Done():
 		return nil, fmt.Errorf("timeout in RPC call. Function: %s", function)
+	}
+}
+
+// RpcResponse is one response to a broadcast RPC request.
+type RpcResponse struct {
+	Sender string
+	Body   []byte
+}
+
+// RpcMany publishes an RPC and collects responses until ctx expires. It is
+// intended for broadcast requests such as discover, where multiple agents
+// answer the same correlation ID.
+func (agent *Agent) RpcMany(ctx context.Context, exchange, routingKey, function string, payload any) ([]RpcResponse, error) {
+	agent.mu.RLock()
+	connection, rpcQueue := agent.connection, agent.rpcQueue
+	agent.mu.RUnlock()
+	if connection == nil || rpcQueue == nil {
+		return nil, fmt.Errorf("no connection established")
+	}
+	data, err := json.Marshal(rpcEnvelope{Function: function, Payload: payload})
+	if err != nil {
+		return nil, err
+	}
+	correlationID := makeCorrelationId()
+	responseCh := make(chan amqp.Delivery, 1024)
+	agent.pendingMu.Lock()
+	agent.pending[correlationID] = responseCh
+	agent.pendingMu.Unlock()
+	defer func() { agent.pendingMu.Lock(); delete(agent.pending, correlationID); agent.pendingMu.Unlock() }()
+	msg := amqp.Publishing{ContentType: "text/plain", CorrelationId: correlationID, ReplyTo: rpcQueue.Name, Body: data, AppId: agent.token}
+	if err := connection.channel.PublishWithContext(ctx, exchange, routingKey, true, false, msg); err != nil {
+		return nil, fmt.Errorf("failed to publish RPC message: %w", err)
+	}
+	responses := []RpcResponse{}
+	for {
+		select {
+		case response := <-responseCh:
+			responses = append(responses, RpcResponse{Sender: response.AppId, Body: append([]byte(nil), response.Body...)})
+		case <-ctx.Done():
+			return responses, nil
+		}
 	}
 }
 
